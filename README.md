@@ -290,8 +290,8 @@ H and E updates are fused into two scheduler phases per time step: all three H c
 parallel region, then all three E components share one. CPML auxiliary variables are read and
 written only inside the PML layers; outside, the derivative is the plain Yee stencil.
 
-On the development machine, the included benchmark measured about 126 Mcell-updates/s with one
-worker and 317 with four (Release, 120×120×240 grid, 300 steps, 193 nm vacuum), a 2.5× speedup.
+On the development machine, the included benchmark measured about 130 Mcell-updates/s with one
+worker and 344 with four (Release, 120×120×240 grid, 300 steps, 193 nm vacuum), a 2.6× speedup.
 For large masks, shared memory bandwidth is usually the limiting factor; use a grid just large
 enough for the pulse and the CPML.
 
@@ -417,7 +417,7 @@ The optimized four-worker loop was measured against the pre-fusion trace on the 
 | Same, 256-row grain | 3.29 s | 43.5 ms | 0.969 | 3.1% |
 | Same, 512-row grain | 3.36 s | 42.5 ms | 0.976 | 2.4% |
 
-The serial loop dropped from 12.11 s before fusion to 8.30 s with one worker. The four-worker
+The serial loop dropped from 12.11 s before fusion to about 8.0–8.3 s with one worker. The four-worker
 step-0 speedup is `4 * 0.956 / 1.56 = 2.45`, matching the measured ~2.5×: fusion and boundary-only
 CPML reduced absolute work, but concurrent workers still inflate total work by 1.56× because of
 memory/cache bandwidth and per-core throughput. Larger grains reduce worker idle (19.5% → 4.4% →
