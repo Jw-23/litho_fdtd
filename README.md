@@ -323,10 +323,13 @@ litho::Options options;
 options.directory = "runs/fdtd-001"; // must be a fresh directory
 options.build_id = "fdtd-release";
 options.source_revision = "your-git-revision";
-litho::Session trace(options);
+auto opened = litho::Session::open(options);
+if (!opened) { /* opened.error().describe() */ }
+auto& trace = opened.value();
 p.run.trace.session = &trace; // works with problem and mask_problem
 p.run.trace.context = trace.stream("mask-job", {}, LT_SOURCE);
-p.run.trace.step_interval = 100; // 0 disables step/kernel samples
+p.run.trace.step_interval = 1;   // sample every step; 0 disables kernel spans
+p.run.trace.detail_steps = 1;    // also emit per-chunk worker spans for step 0
 {
     auto result = compute_mask_spectrum(p);
     if (!result) { /* message(result.error()) */ }
@@ -343,18 +346,36 @@ Events carry source locations and explicit parent contexts. Category `fdtd` cove
 configuration, preparation, completion, errors, and stage spans: mask spectrum,
 reference/patterned runs, solve, voxelization, coefficients, initialization, time
 loop, and postprocessing. Category `fdtd.step` records each block and its progress.
-Category `fdtd.kernel` samples H updates, E updates, and monitor accumulation on
-**the first step of each block**, rather than summing all steps. Filter categories
-with `Options::categories`. No per-cell worker events are emitted.
+Category `fdtd.kernel` records one span per update component
+(`update_hx` … `update_ez`) and monitor accumulation on **the first step of each
+block**. Every such span carries a `summary` instant with:
+
+| Field | Meaning |
+| --- | --- |
+| `wall_ns` | phase wall time on the calling thread |
+| `main_work_ns` | time the calling thread spent inside its own chunks |
+| `wait_ns` | `wall_ns - main_work_ns` |
+| `work_ns` | sum of all chunk durations; only when `detail_steps` applies |
+| `chunks` | executed chunk count |
+| `utilization` | `work_ns / (wall_ns * workers)`; only for detailed steps |
+| `main_fraction` | `main_work_ns / wall_ns` |
+
+`detail_steps` (default 1) additionally records child spans in category
+`fdtd.chunk` for the first N sampled steps, so the timeline shows each worker's
+active intervals and the barrier tail. A high `utilization` with a poor speedup
+means per-worker throughput dropped (memory/cache contention); a low
+`utilization` means workers are idle or imbalanced. Filter categories with
+`Options::categories`.
 
 `elapsed_seconds` measures the time loop including any enabled instrumentation;
 the outer solve span and benchmark wall time also cover setup and postprocessing.
 
 ```sh
-./build/release/benchmarks/litho_fdtd_benchmark 4 monitors
-./build/release/benchmarks/litho_fdtd_benchmark 4 monitors runs/fdtd-benchmark-001
-../litho_tracing/build/litho_analyze runs/fdtd-benchmark-001 summary
-../litho_tracing/build/litho_analyze runs/fdtd-benchmark-001 export runs/fdtd-benchmark-001/perfetto.json
+./build/release/benchmarks/litho_fdtd_benchmark 4 runs/fdtd-w4
+./build/release/benchmarks/litho_fdtd_benchmark 4 monitors runs/fdtd-benchmark-monitors
+../litho_tracing/build/litho_analyze runs/fdtd-w4 summary
+../litho_tracing/build/litho_analyze runs/fdtd-w4 serve web/dist 8090
+../litho_tracing/build/litho_analyze runs/fdtd-w4 export runs/fdtd-w4/perfetto.json
 ./build/release/benchmarks/litho_fdtd_spectrum_benchmark
 ```
 
@@ -374,10 +395,26 @@ tracing disabled):
 | 120×120×240, 300 steps, 4 workers, three four-frequency monitors, median of three loops | 4.553 s | 4.254 s |
 
 These correspond to about 5.9× faster spectrum extraction and 6.6% less time in
-the monitored loop, rather than a universal field-kernel speedup. One traced run
-with 50-step blocks took 4.265 s, wrote 72 events without drops, and successfully
-exported to Perfetto. This single observation is not an instrumentation overhead
-bound; hardware, workload, and queue policies affect results.
+the monitored loop, rather than a universal field-kernel speedup.
+
+A separate wait analysis used the same 120×120×240, 300-step vacuum grid with no
+monitors and `step_interval = 1`, `detail_steps = 1`:
+
+| Workers | Loop time | Step-0 phase work | Worker utilization | Worker idle | Main-thread wait |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 12.11 s | 42.2 ms | 1.00 | ~0% | ~0% |
+| 4 | 4.63 s | 57.1 ms | 0.805 | 19.5% | 0.7–1.2% |
+| 10 | 4.03 s | 98.3 ms | 0.644 | 35.6% | 1.4–2.1% |
+
+The four-worker step-0 speedup is `4 * 0.805 / 1.35 = 2.39`, matching the measured
+~2.4×: total work grew 1.35× because concurrent workers lose per-core throughput,
+and workers are idle for about 20% of the phase at batch boundaries and the
+barrier tail. The main thread itself waits only ~1%; the wait is on the workers,
+not in serial monitor work. At ten workers the work grows 2.33× and utilization
+falls to 0.644, so throughput only reaches ~2.8×; the extra threads include
+efficiency cores and increase memory/cache pressure. Traced runs wrote
+7,230–12,654 events with zero drops; the panel exposes the per-worker chunk
+intervals and the barrier tail. These numbers are hardware-specific.
 
 For future batch workloads, reference-spectrum reuse and prepared grid/material
 coefficients are useful candidates. The current high-level API still voxelizes

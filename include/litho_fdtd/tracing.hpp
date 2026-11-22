@@ -12,6 +12,7 @@ struct trace_options {
     litho::Session* session = nullptr;
     litho::Context context{};
     std::size_t step_interval = 100; // 0 disables step spans
+    std::size_t detail_steps = 1; // first N sampled steps also emit chunk spans
 };
 
 } // namespace litho::fdtd

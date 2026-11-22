@@ -125,7 +125,13 @@ void trace_checks() {
     }
     litho::Options options;
     options.directory = directory.string();
-    litho::Session session(options);
+    auto opened = litho::Session::open(options);
+    CHECK(opened.has_value());
+    if (!opened) {
+        std::filesystem::remove_all(directory);
+        return;
+    }
+    auto& session = opened.value();
     const auto root = session.stream("test");
     p.run.trace = {&session, root, 2};
     const auto traced = solve(p);
@@ -152,12 +158,19 @@ void trace_checks() {
     session.close();
     CHECK(session.stats().dropped_events == 0);
     CHECK(session.stats().error.empty());
-    const auto events = litho::read_events((directory / "events.lt").string());
-    CHECK(events.error.empty() && !events.incomplete_tail);
+    auto events = litho::read_events((directory / "events.lt").string());
+    CHECK(events.has_value());
+    if (!events) {
+        std::filesystem::remove_all(directory);
+        return;
+    }
+    const auto& read = events.value();
+    CHECK(!read.incomplete_tail);
     std::map<std::uint64_t, std::uint64_t> parents;
-    std::size_t begins = 0, ends = 0, progress = 0;
+    std::size_t begins = 0, ends = 0, progress = 0, summaries = 0, chunk_spans = 0;
+    bool has_wait_field = false;
     bool failed = false, prepared = false, reference = false, patterned = false;
-    for (const auto& event : events.events) {
+    for (const auto& event : read.events) {
         if (event.kind == litho::EventKind::Begin) {
             ++begins;
             parents[event.context.span_id] = event.context.parent_span_id;
@@ -166,6 +179,12 @@ void trace_checks() {
         }
         if (event.kind == litho::EventKind::End) ++ends;
         if (event.name == "progress") ++progress;
+        if (event.name == "summary") {
+            ++summaries;
+            for (const auto& field : event.fields)
+                has_wait_field |= field.name == "wait_ns";
+        }
+        if (event.category == "fdtd.chunk") ++chunk_spans;
         failed |= event.name == "failed";
         prepared |= event.name == "prepared";
         reference |= event.name == "reference";
@@ -173,6 +192,7 @@ void trace_checks() {
     }
     CHECK(begins == ends && begins >= 10);
     CHECK(progress == 3 && failed && prepared && reference && patterned);
+    CHECK(summaries >= 6 && has_wait_field && chunk_spans != 0);
     for (const auto& [id, parent] : parents) {
         (void)id;
         CHECK(parent == root.span_id || parents.contains(parent));

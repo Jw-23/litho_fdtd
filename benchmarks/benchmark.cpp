@@ -3,7 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
-#include <memory>
+#include <optional>
 #include <chrono>
 
 
@@ -23,8 +23,10 @@ int main(int argc, char** argv) {
     value.run.steps = 300;
     value.run.workers = argc > 1 ? static_cast<std::size_t>(std::strtoull(argv[1], nullptr, 10)) : 0;
 
-    // Optional monitor workload and a fresh tracing directory.
-    if (argc > 2 && std::string(argv[2]) == "monitors") {
+    // Optional monitor workload and a fresh tracing directory. The trace
+    // directory may be the second argument when no monitor workload is used.
+    const std::string mode = argc > 2 ? argv[2] : "";
+    if (mode == "monitors") {
         for (std::size_t index : {100u, 140u, 180u}) {
             monitor detector;
             detector.index = index;
@@ -33,19 +35,29 @@ int main(int argc, char** argv) {
             value.monitors.push_back(std::move(detector));
         }
     }
-    std::unique_ptr<litho::Session> trace;
-    if (argc > 3) {
+    const char* trace_directory = argc > 3 ? argv[3] : (argc > 2 && mode != "monitors" ? argv[2] : nullptr);
+    std::optional<litho::Session> trace;
+    if (trace_directory) {
         litho::Options options;
-        options.directory = argv[3];
+        options.directory = trace_directory;
         options.build_id = "fdtd-benchmark-release";
-        trace = std::make_unique<litho::Session>(options);
-        value.run.trace.session = trace.get();
+        options.source_revision = "working-tree";
+        options.dumps_enabled = false;
+        auto opened = litho::Session::open(options);
+        if (!opened) {
+            std::fprintf(stderr, "trace open failed: %s\n", opened.error().describe().c_str());
+            return 1;
+        }
+        trace.emplace(std::move(opened.value()));
+        value.run.trace.session = &*trace;
         value.run.trace.context = trace->stream("benchmark", {}, LT_SOURCE);
-        value.run.trace.step_interval = 50;
+        value.run.trace.step_interval = 1;
+        value.run.trace.detail_steps = 1;
     }
     const auto wall_start = std::chrono::steady_clock::now();
     auto result = solve(value);
     if (!result) {
+        if (trace) trace->close();
         std::fprintf(stderr, "benchmark failed: %s\n", std::string(message(result.error())).c_str());
         return 1;
     }

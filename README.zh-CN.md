@@ -297,11 +297,14 @@ litho::Options options;
 options.directory = "runs/fdtd-001"; // 每次运行使用新目录
 options.build_id = "fdtd-release";
 options.source_revision = "your-git-revision";
-litho::Session trace(options);
+auto opened = litho::Session::open(options);
+if (!opened) { /* opened.error().describe() */ }
+auto& trace = opened.value();
 
 p.run.trace.session = &trace; // problem 和 mask_problem 都通过 run 配置
 p.run.trace.context = trace.stream("mask-job", {}, LT_SOURCE);
-p.run.trace.step_interval = 100; // 每 100 步一组；0 只保留阶段事件
+p.run.trace.step_interval = 1;   // 每步采样；0 关闭 kernel span
+p.run.trace.detail_steps = 1;    // 第 0 步额外记录 per-chunk worker span
 {
     auto result = compute_mask_spectrum(p);
     if (!result) { /* message(result.error()) */ }
@@ -317,18 +320,30 @@ Session 由调用方管理，必须覆盖求解调用的整个生命周期。默
 - `fdtd`：`mask_spectrum`、`reference` / `patterned`、`solve`、`voxelize`、`coefficients`、
   `run`、`initialize`、`time_loop`、`postprocess` 阶段，以及配置、准备完成、完成和失败事件。
 - `fdtd.step`：每组时间步的 span 和进度，包含起始步、已完成步和总步数。
-- `fdtd.kernel`：每组**第一步**的 H 更新、E 更新和监视器累积耗时采样；这些 span 不代表整组的
-  累计耗时。可通过 `Options::categories` 过滤类别。
+- `fdtd.kernel`：每组**第一步**按分量记录 `update_hx` … `update_ez` 和 monitor span。每个
+  phase span 带一个 `summary` instant：
+  - `wall_ns`：调用线程看到的 phase 墙钟时间；
+  - `main_work_ns`：调用线程自己执行 chunk 的时间；
+  - `wait_ns`：`wall_ns - main_work_ns`；
+  - `work_ns`：所有 worker chunk 时长之和（仅 detail 步）；
+  - `chunks`：实际 chunk 数；
+  - `utilization`：`work_ns / (wall_ns * workers)`（仅 detail 步）；
+  - `main_fraction`：`main_work_ns / wall_ns`。
+- `fdtd.chunk`：`detail_steps` 指定前 N 个采样步的 worker chunk span，用于在时间线中查看各
+  worker 的活跃区间和 barrier 尾部。`utilization` 接近 1 但加速比低，说明单 worker 吞吐下降
+  （内存/缓存竞争）；`utilization` 低说明 worker 空闲或负载不均。可通过 `Options::categories`
+  过滤类别。
 
 事件包含源码位置与显式父子 span；参考运行和完整结构运行可以分别查看。
 `elapsed_seconds` 仍只计时间循环（启用采集时包含循环内插桩开销）；外层 `solve` span 包含准备和
 后处理，基准还输出整个 solve 的墙钟时间。工作线程内不逐单元记录事件。
 
 ```sh
-./build/release/benchmarks/litho_fdtd_benchmark 4 monitors
-./build/release/benchmarks/litho_fdtd_benchmark 4 monitors runs/fdtd-benchmark-001
-../litho_tracing/build/litho_analyze runs/fdtd-benchmark-001 summary
-../litho_tracing/build/litho_analyze runs/fdtd-benchmark-001 export runs/fdtd-benchmark-001/perfetto.json
+./build/release/benchmarks/litho_fdtd_benchmark 4 runs/fdtd-w4
+./build/release/benchmarks/litho_fdtd_benchmark 4 monitors runs/fdtd-benchmark-monitors
+../litho_tracing/build/litho_analyze runs/fdtd-w4 summary
+../litho_tracing/build/litho_analyze runs/fdtd-w4 serve web/dist 8090
+../litho_tracing/build/litho_analyze runs/fdtd-w4 export runs/fdtd-w4/perfetto.json
 ./build/release/benchmarks/litho_fdtd_spectrum_benchmark
 ```
 
@@ -344,10 +359,21 @@ Session 由调用方管理，必须覆盖求解调用的整个生命周期。默
 | 120×120 平面、169 级次，五次平均 | 81.023 ms | 13.703 ms | 约 5.9 倍速度 |
 | 120×120×240、300 步、三个四频监视器，三次时间循环中位数 | 4.553 s | 4.254 s | 耗时减少 6.6% |
 
-同一监视器任务开启每 50 步的采样记录后，一次测得 4.265 s、72 条事件、零丢弃，并成功回读与
-导出 Perfetto。该单次结果用于确认接入开销没有明显异常，不作为严格的开销上限；不同硬件、网格、
-频率数和队列策略的表现会变化。上述收益分别属于频谱后处理和含监视器的时间循环，不能作为所有
-FDTD 场更新核的加速倍数。
+同一 120×120×240、300 步真空网格、无监视器的等待分析（`step_interval = 1`、
+`detail_steps = 1`）：
+
+| workers | 时间循环 | 第 0 步 phase 总工作量 | worker utilization | worker 空闲 | 主线程等待 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 12.11 s | 42.2 ms | 1.00 | ~0% | ~0% |
+| 4 | 4.63 s | 57.1 ms | 0.805 | 19.5% | 0.7–1.2% |
+| 10 | 4.03 s | 98.3 ms | 0.644 | 35.6% | 1.4–2.1% |
+
+4 worker 的第 0 步加速比为 `4 * 0.805 / 1.35 = 2.39`，与实测约 2.4 倍一致：并发 worker
+的单核吞吐下降使总工作量增大到 1.35 倍，另有约 20% 的 phase 时间消耗在批边界和 barrier
+尾部，worker 处于空闲。主线程自身等待只有约 1%；等待发生在 worker 上，而不是串行监视器。
+10 worker 时总工作量增大到 2.33 倍、utilization 降到 0.644，因此吞吐仅约 2.8 倍；额外线程
+包含能效核，并加剧内存/缓存压力。三次采集分别写入 7,230–12,654 条事件、零丢弃；分析面板
+可查看各 worker 的 chunk 活跃区间和 barrier 尾部。数据与硬件相关。
 
 后续可优先评估批量任务中的参考频谱复用，以及网格/材料系数的预编译与复用；当前高层接口仍按每次
 请求重新体素化并执行参考仿真，尚未加入缓存生命周期接口。

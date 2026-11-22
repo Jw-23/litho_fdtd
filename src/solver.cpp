@@ -105,7 +105,7 @@ template<class Scalar>
 result<void> update_ex(const grid& domain, field_state<Scalar>& f, const detail::cpml_set& cpml,
                detail::cpml_memory<Scalar>& memory, const material_coefficients& coefficients,
                dispersion_state<Scalar>* dispersion, complex phase_y_inverse, complex phase_z_inverse,
-               std::size_t workers) {
+               std::size_t workers, trace_options trace, std::size_t step) {
     const std::size_t nx = domain.cells[0], ny = domain.cells[1], nz = domain.cells[2];
     const std::size_t sy = nx, sz = nx * ny;
     const double inverse_dy = 1.0 / domain.spacing[1], inverse_dz = 1.0 / domain.spacing[2];
@@ -121,7 +121,7 @@ result<void> update_ex(const grid& domain, field_state<Scalar>& f, const detail:
     const auto* drude_a = coefficients.has_drude ? coefficients.drude_a[0].data() : nullptr;
     const auto* drude_b = coefficients.has_drude ? coefficients.drude_b[0].data() : nullptr;
 
-    return detail::parallel_for(nz * ny, workers, [&](std::size_t row_begin, std::size_t row_end) {
+    return detail::parallel_for(nz * ny, workers, "update_ex", trace, step, [&](std::size_t row_begin, std::size_t row_end) {
         for (std::size_t row = row_begin; row < row_end; ++row) {
             const std::size_t k = row / ny;
             const std::size_t j = row % ny;
@@ -161,7 +161,7 @@ template<class Scalar>
 result<void> update_ey(const grid& domain, field_state<Scalar>& f, const detail::cpml_set& cpml,
                detail::cpml_memory<Scalar>& memory, const material_coefficients& coefficients,
                dispersion_state<Scalar>* dispersion, complex phase_x_inverse, complex phase_z_inverse,
-               std::size_t workers) {
+               std::size_t workers, trace_options trace, std::size_t step) {
     const std::size_t nx = domain.cells[0], ny = domain.cells[1], nz = domain.cells[2];
     const std::size_t sx = 1, sz = nx * ny;
     const double inverse_dx = 1.0 / domain.spacing[0], inverse_dz = 1.0 / domain.spacing[2];
@@ -177,7 +177,7 @@ result<void> update_ey(const grid& domain, field_state<Scalar>& f, const detail:
     const auto* drude_a = coefficients.has_drude ? coefficients.drude_a[1].data() : nullptr;
     const auto* drude_b = coefficients.has_drude ? coefficients.drude_b[1].data() : nullptr;
 
-    return detail::parallel_for(nz * ny, workers, [&](std::size_t row_begin, std::size_t row_end) {
+    return detail::parallel_for(nz * ny, workers, "update_ey", trace, step, [&](std::size_t row_begin, std::size_t row_end) {
         for (std::size_t row = row_begin; row < row_end; ++row) {
             const std::size_t k = row / ny;
             const std::size_t j = row % ny;
@@ -217,7 +217,7 @@ template<class Scalar>
 result<void> update_ez(const grid& domain, field_state<Scalar>& f, const detail::cpml_set& cpml,
                detail::cpml_memory<Scalar>& memory, const material_coefficients& coefficients,
                dispersion_state<Scalar>* dispersion, complex phase_x_inverse, complex phase_y_inverse,
-               std::size_t workers) {
+               std::size_t workers, trace_options trace, std::size_t step) {
     const std::size_t nx = domain.cells[0], ny = domain.cells[1], nz = domain.cells[2];
     const std::size_t sx = 1, sy = nx;
     const double inverse_dx = 1.0 / domain.spacing[0], inverse_dy = 1.0 / domain.spacing[1];
@@ -233,7 +233,7 @@ result<void> update_ez(const grid& domain, field_state<Scalar>& f, const detail:
     const auto* drude_a = coefficients.has_drude ? coefficients.drude_a[2].data() : nullptr;
     const auto* drude_b = coefficients.has_drude ? coefficients.drude_b[2].data() : nullptr;
 
-    return detail::parallel_for(nz * ny, workers, [&](std::size_t row_begin, std::size_t row_end) {
+    return detail::parallel_for(nz * ny, workers, "update_ez", trace, step, [&](std::size_t row_begin, std::size_t row_end) {
         for (std::size_t row = row_begin; row < row_end; ++row) {
             const std::size_t k = row / ny;
             const std::size_t j = row % ny;
@@ -272,7 +272,7 @@ result<void> update_ez(const grid& domain, field_state<Scalar>& f, const detail:
 template<class Scalar>
 result<void> update_hx(const grid& domain, field_state<Scalar>& f, const detail::cpml_set& cpml,
                detail::cpml_memory<Scalar>& memory, const material_coefficients& coefficients,
-               complex phase_y, complex phase_z, std::size_t workers) {
+               complex phase_y, complex phase_z, std::size_t workers, trace_options trace, std::size_t step) {
     const std::size_t nx = domain.cells[0], ny = domain.cells[1], nz = domain.cells[2];
     const std::size_t sy = nx, sz = nx * ny;
     const double inverse_dy = 1.0 / domain.spacing[1], inverse_dz = 1.0 / domain.spacing[2];
@@ -285,7 +285,7 @@ result<void> update_hx(const grid& domain, field_state<Scalar>& f, const detail:
     Scalar* psi_z = memory.hx_z.empty() ? nullptr : memory.hx_z.data();
     const auto* cb = coefficients.h_cb[0].data();
 
-    return detail::parallel_for(nz * ny, workers, [&](std::size_t row_begin, std::size_t row_end) {
+    return detail::parallel_for(nz * ny, workers, "update_hx", trace, step, [&](std::size_t row_begin, std::size_t row_end) {
         for (std::size_t row = row_begin; row < row_end; ++row) {
             const std::size_t k = row / ny;
             const std::size_t j = row % ny;
@@ -316,7 +316,7 @@ result<void> update_hx(const grid& domain, field_state<Scalar>& f, const detail:
 template<class Scalar>
 result<void> update_hy(const grid& domain, field_state<Scalar>& f, const detail::cpml_set& cpml,
                detail::cpml_memory<Scalar>& memory, const material_coefficients& coefficients,
-               complex phase_x, complex phase_z, std::size_t workers) {
+               complex phase_x, complex phase_z, std::size_t workers, trace_options trace, std::size_t step) {
     const std::size_t nx = domain.cells[0], ny = domain.cells[1], nz = domain.cells[2];
     const std::size_t sx = 1, sz = nx * ny;
     const double inverse_dx = 1.0 / domain.spacing[0], inverse_dz = 1.0 / domain.spacing[2];
@@ -329,7 +329,7 @@ result<void> update_hy(const grid& domain, field_state<Scalar>& f, const detail:
     Scalar* psi_z = memory.hy_z.empty() ? nullptr : memory.hy_z.data();
     const auto* cb = coefficients.h_cb[1].data();
 
-    return detail::parallel_for(nz * ny, workers, [&](std::size_t row_begin, std::size_t row_end) {
+    return detail::parallel_for(nz * ny, workers, "update_hy", trace, step, [&](std::size_t row_begin, std::size_t row_end) {
         for (std::size_t row = row_begin; row < row_end; ++row) {
             const std::size_t k = row / ny;
             const std::size_t j = row % ny;
@@ -360,7 +360,7 @@ result<void> update_hy(const grid& domain, field_state<Scalar>& f, const detail:
 template<class Scalar>
 result<void> update_hz(const grid& domain, field_state<Scalar>& f, const detail::cpml_set& cpml,
                detail::cpml_memory<Scalar>& memory, const material_coefficients& coefficients,
-               complex phase_x, complex phase_y, std::size_t workers) {
+               complex phase_x, complex phase_y, std::size_t workers, trace_options trace, std::size_t step) {
     const std::size_t nx = domain.cells[0], ny = domain.cells[1], nz = domain.cells[2];
     const std::size_t sx = 1, sy = nx;
     const double inverse_dx = 1.0 / domain.spacing[0], inverse_dy = 1.0 / domain.spacing[1];
@@ -373,7 +373,7 @@ result<void> update_hz(const grid& domain, field_state<Scalar>& f, const detail:
     Scalar* psi_y = memory.hz_y.empty() ? nullptr : memory.hz_y.data();
     const auto* cb = coefficients.h_cb[2].data();
 
-    return detail::parallel_for(nz * ny, workers, [&](std::size_t row_begin, std::size_t row_end) {
+    return detail::parallel_for(nz * ny, workers, "update_hz", trace, step, [&](std::size_t row_begin, std::size_t row_end) {
         for (std::size_t row = row_begin; row < row_end; ++row) {
             const std::size_t k = row / ny;
             const std::size_t j = row % ny;
@@ -421,7 +421,7 @@ result<void> initialize_fields(field_state<Scalar>& fields, const source_info& s
     const double dx = domain.spacing[0], dy = domain.spacing[1], dz = domain.spacing[2];
     const double x0 = domain.origin[0], y0 = domain.origin[1], z0 = domain.origin[2];
     const double half_time_phase = 0.5 * source.omega * dt;
-    return detail::parallel_for(nz * ny, workers, [&](std::size_t row_begin, std::size_t row_end) {
+    return detail::parallel_for(nz * ny, workers, "initialize", trace_options{}, 0, [&](std::size_t row_begin, std::size_t row_end) {
         for (std::size_t row = row_begin; row < row_end; ++row) {
             const std::size_t k = row / ny;
             const std::size_t j = row % ny;
@@ -722,42 +722,58 @@ result<run_result> run_impl(const problem& value, const source_info& source,
                 for (std::size_t step = first; step < end; ++step) {
                     auto kernel_trace = step_span.options();
                     if (step != first || trace.step_interval == 0) kernel_trace.session = nullptr;
-                    detail::trace_span h_span(kernel_trace, "sampled_h_update", LT_SOURCE, "fdtd.kernel");
                     const double time_magnetic = (static_cast<double>(step) + 0.5) * dt;
                     const double time_electric = (static_cast<double>(step) + 1.0) * dt;
                     if (auto status = update_hx(domain, fields, cpml, memory, coefficients, source.phase[1],
-                                                source.phase[2], workers);
+                                                source.phase[2], workers, kernel_trace, step);
                         !status)
                         return fail(status.error());
                     if (auto status = update_hy(domain, fields, cpml, memory, coefficients, source.phase[0],
-                                                source.phase[2], workers);
+                                                source.phase[2], workers, kernel_trace, step);
                         !status)
                         return fail(status.error());
                     if (auto status = update_hz(domain, fields, cpml, memory, coefficients, source.phase[0],
-                                                source.phase[1], workers);
+                                                source.phase[1], workers, kernel_trace, step);
                         !status)
                         return fail(status.error());
-                    h_span.finish();
-                    detail::trace_span e_span(kernel_trace, "sampled_e_update", LT_SOURCE, "fdtd.kernel");
                     if (auto status = update_ex(domain, fields, cpml, memory, coefficients,
                                                 coefficients.has_drude ? &dispersion : nullptr, source.phase_inv[1],
-                                                source.phase_inv[2], workers);
+                                                source.phase_inv[2], workers, kernel_trace, step);
                         !status)
                         return fail(status.error());
                     if (auto status = update_ey(domain, fields, cpml, memory, coefficients,
                                                 coefficients.has_drude ? &dispersion : nullptr, source.phase_inv[0],
-                                                source.phase_inv[2], workers);
+                                                source.phase_inv[2], workers, kernel_trace, step);
                         !status)
                         return fail(status.error());
                     if (auto status = update_ez(domain, fields, cpml, memory, coefficients,
                                                 coefficients.has_drude ? &dispersion : nullptr, source.phase_inv[0],
-                                                source.phase_inv[1], workers);
+                                                source.phase_inv[1], workers, kernel_trace, step);
                         !status)
                         return fail(status.error());
-                    e_span.finish();
-                    detail::trace_span monitor_span(kernel_trace, "sampled_monitor", LT_SOURCE, "fdtd.kernel");
+                    const auto monitor_start = std::chrono::steady_clock::now();
+                    detail::trace_span monitor_span(kernel_trace, "monitor", LT_SOURCE, "fdtd.kernel");
                     accumulate_monitors(domain, value.monitors, accumulators, fields, time_electric,
                                         time_magnetic, source.complex_mode);
+                    const auto monitor_wall = static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - monitor_start)
+                            .count());
+                    monitor_span.event(
+                        "summary",
+                        [&] {
+                            return litho::Fields{litho::field("step", static_cast<std::uint64_t>(step)),
+                                                 litho::field("workers", std::uint64_t{1}),
+                                                 litho::field("items", std::uint64_t{1}),
+                                                 litho::field("wall_ns", monitor_wall),
+                                                 litho::field("main_work_ns", monitor_wall),
+                                                 litho::field("wait_ns", std::uint64_t{0}),
+                                                 litho::field("chunks", std::uint64_t{1}),
+                                                 litho::field("work_ns", monitor_wall),
+                                                 litho::field("utilization", 1.0),
+                                                 litho::field("main_fraction", 1.0)};
+                        },
+                        LT_SOURCE);
                 }
                 step_span.event("progress", [&] { return litho::Fields{
                     litho::field("first_step", first), litho::field("completed_steps", end),
