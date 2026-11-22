@@ -1,0 +1,7 @@
+add_executable(litho_fdtd_benchmark benchmark.cpp)
+target_link_libraries(litho_fdtd_benchmark PRIVATE litho_fdtd)
+if(MSVC)
+    target_compile_options(litho_fdtd_benchmark PRIVATE /W4)
+else()
+    target_compile_options(litho_fdtd_benchmark PRIVATE -Wall -Wextra -Wpedantic)
+endif()

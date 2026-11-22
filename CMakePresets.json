@@ -1,0 +1,75 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "common",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": true,
+        "LITHO_FDTD_BUILD_TESTS": true,
+        "LITHO_FDTD_BUILD_EXAMPLES": true,
+        "LITHO_FDTD_WARNINGS_AS_ERRORS": false
+      }
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug",
+      "inherits": "common",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "release",
+      "displayName": "Release",
+      "inherits": "common",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "relwithdebinfo",
+      "displayName": "Release with debug information",
+      "inherits": "common",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "debug", "configurePreset": "debug" },
+    { "name": "release", "configurePreset": "release" },
+    { "name": "relwithdebinfo", "configurePreset": "relwithdebinfo" }
+  ],
+  "testPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    },
+    {
+      "name": "relwithdebinfo",
+      "configurePreset": "relwithdebinfo",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    }
+  ],
+  "workflowPresets": [
+    { "name": "debug", "steps": [
+      { "type": "configure", "name": "debug" },
+      { "type": "build", "name": "debug" },
+      { "type": "test", "name": "debug" } ] },
+    { "name": "release", "steps": [
+      { "type": "configure", "name": "release" },
+      { "type": "build", "name": "release" },
+      { "type": "test", "name": "release" } ] },
+    { "name": "relwithdebinfo", "steps": [
+      { "type": "configure", "name": "relwithdebinfo" },
+      { "type": "build", "name": "relwithdebinfo" },
+      { "type": "test", "name": "relwithdebinfo" } ] }
+  ]
+}

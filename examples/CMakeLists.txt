@@ -1,0 +1,7 @@
+add_executable(litho_fdtd_mask_example mask_spectrum.cpp)
+target_link_libraries(litho_fdtd_mask_example PRIVATE litho_fdtd)
+if(MSVC)
+    target_compile_options(litho_fdtd_mask_example PRIVATE /W4)
+else()
+    target_compile_options(litho_fdtd_mask_example PRIVATE -Wall -Wextra -Wpedantic)
+endif()
