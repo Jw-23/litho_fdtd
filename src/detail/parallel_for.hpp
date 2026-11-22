@@ -17,6 +17,10 @@ namespace litho::fdtd::detail {
     return std::max<std::size_t>(1, std::thread::hardware_concurrency());
 }
 
+[[nodiscard]] inline std::size_t effective_workers(std::size_t chunks, std::size_t workers) noexcept {
+    return workers == 1 || (workers == 0 && chunks < 4096) ? 1 : worker_count(workers);
+}
+
 // Dispatch a cache-friendly chunk body through the project's parallel
 // scheduler. Tiny chunk counts stay inline to avoid waking a team for work
 // that is shorter than the synchronization cost. The body writes disjoint
@@ -26,7 +30,7 @@ template<class Body>
     if (chunks == 0) return {};
     // An explicit worker count is honored even for small grids; automatic mode
     // stays inline when the team would cost more than the work.
-    const std::size_t actual = workers == 1 ? 1 : (workers == 0 && chunks < 4096) ? 1 : worker_count(workers);
+    const std::size_t actual = effective_workers(chunks, workers);
     auto status = parallel::for_each_chunk(chunks, actual, std::forward<Body>(body));
     if (!status) {
         if (status.error() == std::errc::not_enough_memory) return fail(errc::allocation_failure);

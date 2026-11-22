@@ -50,6 +50,21 @@ if(NOT TARGET parallel)
 endif()
 target_link_libraries(litho_fdtd PRIVATE parallel)
 
+# Reuse an application-provided target, otherwise use the sibling collector.
+set(LITHO_FDTD_TRACING_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../litho_tracing"
+    CACHE PATH "Path to litho_tracing sources")
+if(NOT TARGET litho::trace)
+    set(_litho_trace_tools "${LITHO_TRACE_BUILD_TOOLS}")
+    set(_litho_trace_tests "${LITHO_TRACE_BUILD_TESTS}")
+    set(LITHO_TRACE_BUILD_TOOLS OFF)
+    set(LITHO_TRACE_BUILD_TESTS OFF)
+    add_subdirectory("${LITHO_FDTD_TRACING_SOURCE_DIR}"
+        "${CMAKE_CURRENT_BINARY_DIR}/litho_tracing" EXCLUDE_FROM_ALL)
+    set(LITHO_TRACE_BUILD_TOOLS "${_litho_trace_tools}")
+    set(LITHO_TRACE_BUILD_TESTS "${_litho_trace_tests}")
+endif()
+target_link_libraries(litho_fdtd PUBLIC litho::trace)
+
 if(MSVC)
     target_compile_options(litho_fdtd PRIVATE /W4)
 else()

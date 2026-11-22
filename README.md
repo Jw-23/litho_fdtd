@@ -301,3 +301,84 @@ memory is usually the limiting factor; use a grid just large enough for the puls
 
 - [Chinese documentation](README.zh-CN.md)
 - [`litho_geometry` geometry library](../litho_geometry/README.md)
+
+## API checks and tracing
+
+`validate(problem)` checks configuration before voxelization and field allocation.
+Source uniformity and material-dependent stability still require `solve`.
+When `run.steps` is set, `duration` is ignored, including validation.
+`monitor_at(grid, axis, position)` constructs an x/y/z monitor at a physical SI
+coordinate and rejects off-grid positions (tolerance: 1e-6 cells).
+`component_values` returns an empty span for invalid indices or truncated buffers.
+`run_result::workers` reports the selected worker count, including serial automatic
+execution on small grids.
+
+The build reuses `litho::trace` or adds the sibling `../litho_tracing` collector
+without building its tools, examples, or tests. Override its source path with
+`LITHO_FDTD_TRACING_SOURCE_DIR`, or call `find_package(litho_trace CONFIG REQUIRED)`
+in the parent project first.
+
+```cpp
+litho::Options options;
+options.directory = "runs/fdtd-001"; // must be a fresh directory
+options.build_id = "fdtd-release";
+options.source_revision = "your-git-revision";
+litho::Session trace(options);
+p.run.trace.session = &trace; // works with problem and mask_problem
+p.run.trace.context = trace.stream("mask-job", {}, LT_SOURCE);
+p.run.trace.step_interval = 100; // 0 disables step/kernel samples
+{
+    auto result = compute_mask_spectrum(p);
+    if (!result) { /* message(result.error()) */ }
+}
+trace.close();
+auto stats = trace.stats(); // inspect dropped_events and error
+```
+
+The caller owns the Session, which must outlive the solve. A null Session disables
+instrumentation. Collection is best effort: synchronous tracing exceptions do not
+change numerical results. Session statistics expose collector drops and I/O errors.
+
+Events carry source locations and explicit parent contexts. Category `fdtd` covers
+configuration, preparation, completion, errors, and stage spans: mask spectrum,
+reference/patterned runs, solve, voxelization, coefficients, initialization, time
+loop, and postprocessing. Category `fdtd.step` records each block and its progress.
+Category `fdtd.kernel` samples H updates, E updates, and monitor accumulation on
+**the first step of each block**, rather than summing all steps. Filter categories
+with `Options::categories`. No per-cell worker events are emitted.
+
+`elapsed_seconds` measures the time loop including any enabled instrumentation;
+the outer solve span and benchmark wall time also cover setup and postprocessing.
+
+```sh
+./build/release/benchmarks/litho_fdtd_benchmark 4 monitors
+./build/release/benchmarks/litho_fdtd_benchmark 4 monitors runs/fdtd-benchmark-001
+../litho_tracing/build/litho_analyze runs/fdtd-benchmark-001 summary
+../litho_tracing/build/litho_analyze runs/fdtd-benchmark-001 export runs/fdtd-benchmark-001/perfetto.json
+./build/release/benchmarks/litho_fdtd_spectrum_benchmark
+```
+
+Build the analyzer separately in `litho_tracing`. The monitor workload records four
+frequencies on three z planes. The spectrum benchmark extracts 169 orders from a
+120×120 plane, repeats five times, and prints a checksum. Separable x/y phases and
+factored stagger offsets reduce complex exponentials from `5*nx*ny` to `nx+ny+2`
+per order. Monitor accumulation now traverses each channel contiguously and avoids
+per-step phase-array allocations.
+
+Local AppleClang 21 Release comparison (identical workloads run sequentially,
+tracing disabled):
+
+| Workload | Before | After |
+| --- | ---: | ---: |
+| 120×120 spectrum, 169 orders, average of five extractions | 81.023 ms | 13.703 ms |
+| 120×120×240, 300 steps, 4 workers, three four-frequency monitors, median of three loops | 4.553 s | 4.254 s |
+
+These correspond to about 5.9× faster spectrum extraction and 6.6% less time in
+the monitored loop, rather than a universal field-kernel speedup. One traced run
+with 50-step blocks took 4.265 s, wrote 72 events without drops, and successfully
+exported to Perfetto. This single observation is not an instrumentation overhead
+bound; hardware, workload, and queue policies affect results.
+
+For future batch workloads, reference-spectrum reuse and prepared grid/material
+coefficients are useful candidates. The current high-level API still voxelizes
+and runs the reference for each request; no cache-lifetime API has been added.

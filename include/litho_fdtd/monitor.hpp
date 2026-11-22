@@ -41,10 +41,14 @@ struct monitor_result {
     [[nodiscard]] std::size_t cell_count() const noexcept { return shape[0] * shape[1]; }
     [[nodiscard]] std::span<const std::complex<double>> component_values(std::size_t frequency_index,
                                                                         component value) const noexcept {
+        const auto c = static_cast<std::size_t>(value);
+        if (frequency_index >= frequencies.size() || c >= 6 || shape[0] == 0 || shape[1] == 0)
+            return {};
+        if (shape[0] > values.size() / shape[1]) return {};
         const std::size_t cells = cell_count();
-        const std::size_t channels = frequencies.size() * 6;
-        const std::size_t channel = frequency_index * 6 + static_cast<std::size_t>(value);
-        if (channel >= channels || cells == 0) return {};
+        const std::size_t channels = values.size() / cells;
+        if (c >= channels || frequency_index > (channels - 1 - c) / 6) return {};
+        const std::size_t channel = frequency_index * 6 + c;
         return {values.data() + channel * cells, cells};
     }
     [[nodiscard]] std::complex<double> at(std::size_t frequency_index, component value,
@@ -57,6 +61,7 @@ struct monitor_result {
 
 [[nodiscard]] inline result<void> validate(const monitor& value, const grid& domain) noexcept {
     const auto normal = static_cast<std::size_t>(value.normal);
+    if (normal >= 3) return fail(errc::invalid_argument);
     if (value.index >= domain.cells[normal]) return fail(errc::out_of_range);
     for (double frequency : value.frequencies)
         if (!std::isfinite(frequency) || !(frequency > 0)) return fail(errc::invalid_argument);
@@ -70,7 +75,7 @@ struct monitor_result {
         const auto& options = *value.spectrum;
         if (options.min_order_x > options.max_order_x || options.min_order_y > options.max_order_y)
             return fail(errc::invalid_argument);
-        if (!value.frequencies.empty() && options.frequency_index >= value.frequencies.size())
+        if (options.frequency_index >= (value.frequencies.empty() ? 1 : value.frequencies.size()))
             return fail(errc::invalid_argument);
         if (!std::isfinite(options.background_index.real()) || !(options.background_index.real() > 0)
             || !std::isfinite(options.background_index.imag()))
@@ -89,6 +94,25 @@ struct monitor_result {
         }
     }
     return {};
+}
+
+// Construct a monitor at an exact grid plane in physical SI coordinates.
+// Off-grid positions are rejected rather than silently rounded.
+[[nodiscard]] inline result<monitor> monitor_at(const grid& domain, axis normal,
+                                                double position) noexcept {
+    if (auto valid = validate(domain); !valid) return fail(valid.error());
+    const auto a = static_cast<std::size_t>(normal);
+    if (a >= 3 || !std::isfinite(position)) return fail(errc::invalid_argument);
+    const double cell = (position - domain.origin[a]) / domain.spacing[a];
+    if (!std::isfinite(cell) || cell < -1e-6 || cell >= static_cast<double>(domain.cells[a]))
+        return fail(errc::out_of_range);
+    const double nearest = std::round(cell);
+    if (std::abs(cell - nearest) > 1e-6) return fail(errc::invalid_configuration);
+    if (nearest < 0 || nearest >= static_cast<double>(domain.cells[a])) return fail(errc::out_of_range);
+    monitor out;
+    out.normal = normal;
+    out.index = static_cast<std::size_t>(nearest);
+    return out;
 }
 
 // Plane dimensions, spacing and the grid origin of the first sample.

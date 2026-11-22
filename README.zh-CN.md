@@ -268,3 +268,86 @@ z×y 行切成适合缓存的块；调用线程参与计算，同一线程的空
 
 - [English documentation](README.md)
 - [`litho_geometry` 几何库](../litho_geometry/README.md)
+
+## 配置检查与监视器定位
+
+`validate(problem)` 可在体素化、场分配之前检查网格、材料引用、边界、光源参数、运行参数和
+监视器。依赖体素化结果的光源均匀性和材料相关稳定性仍由 `solve` 检查。
+显式设置 `run.steps` 时，`duration` 不参与校验或计算。
+
+```cpp
+auto detector = monitor_at(p.grid, axis::z, 450e-9);
+if (!detector) { /* message(detector.error()) */ }
+// 成功后可设置 name、frequencies、time_window、spectrum，并加入 problem.monitors。
+// compute_mask_spectrum 内部也使用相同的坐标转换。
+```
+
+`monitor_at` 支持 x/y/z 法向，按 SI 物理坐标定位；允许的浮点偏差为 1e-6 个网格，
+不在网格平面上的坐标会返回错误。`component_values` 对无效频率、分量和不完整缓冲区返回空 span。
+`run_result::workers` 现在报告实际选择的线程数，自动模式的小网格会报告 1。
+
+## 日志与性能分析
+
+构建会复用已有的 `litho::trace` 目标，否则从 `../litho_tracing` 构建采集库；不会构建其分析工具、
+示例或测试。可用 `-DLITHO_FDTD_TRACING_SOURCE_DIR=/path/to/litho_tracing` 指定其他源码路径，
+也可在上层先 `find_package(litho_trace CONFIG REQUIRED)`。
+
+```cpp
+litho::Options options;
+options.directory = "runs/fdtd-001"; // 每次运行使用新目录
+options.build_id = "fdtd-release";
+options.source_revision = "your-git-revision";
+litho::Session trace(options);
+
+p.run.trace.session = &trace; // problem 和 mask_problem 都通过 run 配置
+p.run.trace.context = trace.stream("mask-job", {}, LT_SOURCE);
+p.run.trace.step_interval = 100; // 每 100 步一组；0 只保留阶段事件
+{
+    auto result = compute_mask_spectrum(p);
+    if (!result) { /* message(result.error()) */ }
+}
+trace.close();
+auto stats = trace.stats(); // 检查 dropped_events 和 error
+```
+
+Session 由调用方管理，必须覆盖求解调用的整个生命周期。默认空指针不记录；求解器不创建目录、
+不输出控制台日志。插桩按尽力方式工作，同步采集异常不会改变求解结果；正常采集后的丢弃与写盘错误
+可通过 Session 统计检查。不要在另一个线程中销毁仍被求解器使用的 Session。
+
+- `fdtd`：`mask_spectrum`、`reference` / `patterned`、`solve`、`voxelize`、`coefficients`、
+  `run`、`initialize`、`time_loop`、`postprocess` 阶段，以及配置、准备完成、完成和失败事件。
+- `fdtd.step`：每组时间步的 span 和进度，包含起始步、已完成步和总步数。
+- `fdtd.kernel`：每组**第一步**的 H 更新、E 更新和监视器累积耗时采样；这些 span 不代表整组的
+  累计耗时。可通过 `Options::categories` 过滤类别。
+
+事件包含源码位置与显式父子 span；参考运行和完整结构运行可以分别查看。
+`elapsed_seconds` 仍只计时间循环（启用采集时包含循环内插桩开销）；外层 `solve` span 包含准备和
+后处理，基准还输出整个 solve 的墙钟时间。工作线程内不逐单元记录事件。
+
+```sh
+./build/release/benchmarks/litho_fdtd_benchmark 4 monitors
+./build/release/benchmarks/litho_fdtd_benchmark 4 monitors runs/fdtd-benchmark-001
+../litho_tracing/build/litho_analyze runs/fdtd-benchmark-001 summary
+../litho_tracing/build/litho_analyze runs/fdtd-benchmark-001 export runs/fdtd-benchmark-001/perfetto.json
+./build/release/benchmarks/litho_fdtd_spectrum_benchmark
+```
+
+分析工具需在 `litho_tracing` 中单独构建。`monitors` 基准添加三个 z 平面，每个平面记录四个频率。
+频谱基准使用 120×120 平面、169 个级次，重复五次并打印校验值。
+频谱提取将复指数按 x/y 分离并提出交错偏移，把每级次的复指数求值从 `5*nx*ny` 降到
+`nx+ny+2`；监视器按频率/分量连续遍历，不再在每一步分配相位数组。
+
+本机 AppleClang 21、Release、4 worker 的前后对照（相同任务串行运行，未开启采集）：
+
+| 场景 | 优化前 | 优化后 | 变化 |
+| --- | ---: | ---: | --- |
+| 120×120 平面、169 级次，五次平均 | 81.023 ms | 13.703 ms | 约 5.9 倍速度 |
+| 120×120×240、300 步、三个四频监视器，三次时间循环中位数 | 4.553 s | 4.254 s | 耗时减少 6.6% |
+
+同一监视器任务开启每 50 步的采样记录后，一次测得 4.265 s、72 条事件、零丢弃，并成功回读与
+导出 Perfetto。该单次结果用于确认接入开销没有明显异常，不作为严格的开销上限；不同硬件、网格、
+频率数和队列策略的表现会变化。上述收益分别属于频谱后处理和含监视器的时间循环，不能作为所有
+FDTD 场更新核的加速倍数。
+
+后续可优先评估批量任务中的参考频谱复用，以及网格/材料系数的预编译与复用；当前高层接口仍按每次
+请求重新体素化并执行参考仿真，尚未加入缓存生命周期接口。

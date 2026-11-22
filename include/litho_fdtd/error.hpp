@@ -1,6 +1,7 @@
 #pragma once
 
 #include <expected>
+#include <functional>
 #include <new>
 #include <stdexcept>
 #include <string_view>

@@ -6,6 +6,7 @@
 #include <litho_fdtd/monitor.hpp>
 #include <litho_fdtd/source.hpp>
 #include <litho_fdtd/structure.hpp>
+#include <litho_fdtd/tracing.hpp>
 
 #include <array>
 #include <cmath>
@@ -20,6 +21,7 @@ struct run_options {
     double duration = 60;  // optical periods when `steps` is unset
     std::optional<std::size_t> steps;
     std::size_t workers = 0; // 0 uses hardware concurrency
+    trace_options trace;
 };
 
 struct problem {
@@ -45,11 +47,15 @@ struct run_result {
 [[nodiscard]] inline result<void> validate(const run_options& value) noexcept {
     if (!std::isfinite(value.courant) || !(value.courant > 0) || value.courant > 1)
         return fail(errc::invalid_configuration);
-    if (!std::isfinite(value.duration) || !(value.duration > 0))
+    if (!value.steps && (!std::isfinite(value.duration) || !(value.duration > 0)))
         return fail(errc::invalid_configuration);
     if (value.steps && *value.steps == 0) return fail(errc::invalid_configuration);
     return {};
 }
+
+// Cheap configuration checks without voxelization or field allocation. Source
+// uniformity and material-dependent stability are checked by solve().
+[[nodiscard]] result<void> validate(const problem& value) noexcept;
 
 // Run a complete FDTD simulation. The function validates the configuration,
 // rasterizes the structure, allocates the field state and executes the time

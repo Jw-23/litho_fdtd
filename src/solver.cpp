@@ -2,6 +2,7 @@
 
 #include "detail/cpml.hpp"
 #include "detail/parallel_for.hpp"
+#include "detail/tracing.hpp"
 
 #include <litho_fdtd/spectrum.hpp>
 
@@ -483,46 +484,38 @@ void accumulate_monitors(const grid& domain, const std::vector<monitor>& monitor
         if (!electric_inside && !magnetic_inside) continue;
         const std::size_t cells = target.cell_count();
         const std::size_t frequency_count = target.frequencies.size();
-        std::vector<complex> phase_electric(frequency_count);
-        std::vector<complex> phase_magnetic(frequency_count);
+        // Traverse one channel at a time: contiguous writes, no per-step heap
+        // allocation, and one phase evaluation per frequency/component pair.
         for (std::size_t f = 0; f < frequency_count; ++f) {
             const double omega = 2.0 * std::numbers::pi * target.frequencies[f];
-            if (complex_mode) {
-                phase_electric[f] = std::exp(complex{0.0, omega * time_electric});
-                phase_magnetic[f] = std::exp(complex{0.0, omega * time_magnetic});
-            } else {
-                phase_electric[f] = 2.0 * std::exp(complex{0.0, -omega * time_electric});
-                phase_magnetic[f] = 2.0 * std::exp(complex{0.0, -omega * time_magnetic});
-            }
-        }
-
-        auto accumulate_cell = [&](std::size_t index, std::size_t plane_index) {
-            for (std::size_t f = 0; f < frequency_count; ++f) {
-                for (std::size_t c = 0; c < 6; ++c) {
-                    if (c < 3 ? !electric_inside : !magnetic_inside) continue;
-                    const complex phase = c < 3 ? phase_electric[f] : phase_magnetic[f];
-                    auto& slot = target.values[(f * 6 + c) * cells + plane_index];
-                    slot += complex(data[c][index]) * phase;
+            const double sign = complex_mode ? 1.0 : -1.0;
+            const double scale = complex_mode ? 1.0 : 2.0;
+            const complex phase_e = scale * std::exp(complex{0.0, sign * omega * time_electric});
+            const complex phase_h = scale * std::exp(complex{0.0, sign * omega * time_magnetic});
+            for (std::size_t c = 0; c < 6; ++c) {
+                if (c < 3 ? !electric_inside : !magnetic_inside) continue;
+                const complex phase = c < 3 ? phase_e : phase_h;
+                auto* output = target.values.data() + (f * 6 + c) * cells;
+                const auto* input = data[c];
+                switch (definition.normal) {
+                case axis::z: {
+                    const std::size_t base = nx * ny * definition.index;
+                    for (std::size_t i = 0; i < cells; ++i)
+                        output[i] += complex(input[base + i]) * phase;
+                    break;
+                }
+                case axis::x:
+                    for (std::size_t k = 0; k < nz; ++k)
+                        for (std::size_t j = 0; j < ny; ++j)
+                            output[j + ny * k] += complex(input[definition.index + nx * (j + ny * k)]) * phase;
+                    break;
+                case axis::y:
+                    for (std::size_t k = 0; k < nz; ++k)
+                        for (std::size_t i = 0; i < nx; ++i)
+                            output[i + nx * k] += complex(input[i + nx * (definition.index + ny * k)]) * phase;
+                    break;
                 }
             }
-        };
-
-        switch (definition.normal) {
-        case axis::z:
-            for (std::size_t j = 0; j < ny; ++j)
-                for (std::size_t i = 0; i < nx; ++i)
-                    accumulate_cell(i + nx * (j + ny * definition.index), i + nx * j);
-            break;
-        case axis::x:
-            for (std::size_t k = 0; k < nz; ++k)
-                for (std::size_t j = 0; j < ny; ++j)
-                    accumulate_cell(definition.index + nx * (j + ny * k), j + ny * k);
-            break;
-        case axis::y:
-            for (std::size_t k = 0; k < nz; ++k)
-                for (std::size_t i = 0; i < nx; ++i)
-                    accumulate_cell(i + nx * (definition.index + ny * k), i + nx * k);
-            break;
         }
     }
 }
@@ -676,10 +669,12 @@ result<source_info> make_source_info(const problem& value, const material_map& m
 template<class Scalar>
 result<run_result> run_impl(const problem& value, const source_info& source,
                             const detail::cpml_set& cpml, const material_coefficients& coefficients,
-                            double dt, std::size_t steps) {
+                            double dt, std::size_t steps, trace_options trace) {
+    detail::trace_span run_span(trace, "run", LT_SOURCE);
     return detail::guard([&]() -> result<run_result> {
         const auto& domain = value.grid;
         const std::size_t count = domain.size();
+        detail::trace_span initialize_span(run_span.options(), "initialize", LT_SOURCE);
         field_state<Scalar> fields;
         allocate(fields, count);
         detail::cpml_memory<Scalar> memory;
@@ -713,43 +708,66 @@ result<run_result> run_impl(const problem& value, const source_info& source,
             accumulators.push_back(std::move(result));
         }
 
+        initialize_span.finish();
         const std::size_t workers = value.run.workers;
         const auto start = std::chrono::steady_clock::now();
-        for (std::size_t step = 0; step < steps; ++step) {
-            const double time_magnetic = (static_cast<double>(step) + 0.5) * dt;
-            const double time_electric = (static_cast<double>(step) + 1.0) * dt;
-            if (auto status = update_hx(domain, fields, cpml, memory, coefficients, source.phase[1],
-                                        source.phase[2], workers);
-                !status)
-                return fail(status.error());
-            if (auto status = update_hy(domain, fields, cpml, memory, coefficients, source.phase[0],
-                                        source.phase[2], workers);
-                !status)
-                return fail(status.error());
-            if (auto status = update_hz(domain, fields, cpml, memory, coefficients, source.phase[0],
-                                        source.phase[1], workers);
-                !status)
-                return fail(status.error());
-            if (auto status = update_ex(domain, fields, cpml, memory, coefficients,
-                                        coefficients.has_drude ? &dispersion : nullptr, source.phase_inv[1],
-                                        source.phase_inv[2], workers);
-                !status)
-                return fail(status.error());
-            if (auto status = update_ey(domain, fields, cpml, memory, coefficients,
-                                        coefficients.has_drude ? &dispersion : nullptr, source.phase_inv[0],
-                                        source.phase_inv[2], workers);
-                !status)
-                return fail(status.error());
-            if (auto status = update_ez(domain, fields, cpml, memory, coefficients,
-                                        coefficients.has_drude ? &dispersion : nullptr, source.phase_inv[0],
-                                        source.phase_inv[1], workers);
-                !status)
-                return fail(status.error());
-            accumulate_monitors(domain, value.monitors, accumulators, fields, time_electric,
-                                time_magnetic, source.complex_mode);
+        {
+            detail::trace_span loop_span(run_span.options(), "time_loop", LT_SOURCE);
+            const std::size_t interval = trace.step_interval == 0 ? steps : trace.step_interval;
+            for (std::size_t first = 0; first < steps;) {
+                const std::size_t end = first + std::min(interval, steps - first);
+                auto step_trace = loop_span.options();
+                if (trace.step_interval == 0) step_trace.session = nullptr;
+                detail::trace_span step_span(step_trace, "steps", LT_SOURCE, "fdtd.step");
+                for (std::size_t step = first; step < end; ++step) {
+                    auto kernel_trace = step_span.options();
+                    if (step != first || trace.step_interval == 0) kernel_trace.session = nullptr;
+                    detail::trace_span h_span(kernel_trace, "sampled_h_update", LT_SOURCE, "fdtd.kernel");
+                    const double time_magnetic = (static_cast<double>(step) + 0.5) * dt;
+                    const double time_electric = (static_cast<double>(step) + 1.0) * dt;
+                    if (auto status = update_hx(domain, fields, cpml, memory, coefficients, source.phase[1],
+                                                source.phase[2], workers);
+                        !status)
+                        return fail(status.error());
+                    if (auto status = update_hy(domain, fields, cpml, memory, coefficients, source.phase[0],
+                                                source.phase[2], workers);
+                        !status)
+                        return fail(status.error());
+                    if (auto status = update_hz(domain, fields, cpml, memory, coefficients, source.phase[0],
+                                                source.phase[1], workers);
+                        !status)
+                        return fail(status.error());
+                    h_span.finish();
+                    detail::trace_span e_span(kernel_trace, "sampled_e_update", LT_SOURCE, "fdtd.kernel");
+                    if (auto status = update_ex(domain, fields, cpml, memory, coefficients,
+                                                coefficients.has_drude ? &dispersion : nullptr, source.phase_inv[1],
+                                                source.phase_inv[2], workers);
+                        !status)
+                        return fail(status.error());
+                    if (auto status = update_ey(domain, fields, cpml, memory, coefficients,
+                                                coefficients.has_drude ? &dispersion : nullptr, source.phase_inv[0],
+                                                source.phase_inv[2], workers);
+                        !status)
+                        return fail(status.error());
+                    if (auto status = update_ez(domain, fields, cpml, memory, coefficients,
+                                                coefficients.has_drude ? &dispersion : nullptr, source.phase_inv[0],
+                                                source.phase_inv[1], workers);
+                        !status)
+                        return fail(status.error());
+                    e_span.finish();
+                    detail::trace_span monitor_span(kernel_trace, "sampled_monitor", LT_SOURCE, "fdtd.kernel");
+                    accumulate_monitors(domain, value.monitors, accumulators, fields, time_electric,
+                                        time_magnetic, source.complex_mode);
+                }
+                step_span.event("progress", [&] { return litho::Fields{
+                    litho::field("first_step", first), litho::field("completed_steps", end),
+                    litho::field("total_steps", steps)}; }, LT_SOURCE);
+                first = end;
+            }
         }
         const auto finish = std::chrono::steady_clock::now();
 
+        detail::trace_span post_span(run_span.options(), "postprocess", LT_SOURCE);
         // The DFT sum of a Gaussian pulse is its envelope integral. Dividing
         // by the analytic integral gives unit spectrum coefficients for a unit
         // amplitude plane wave, independent of the monitor position.
@@ -771,7 +789,7 @@ result<run_result> run_impl(const problem& value, const source_info& source,
         result.steps = steps;
         result.frequency = source.frequency;
         result.source_wavevector = {source.kx, source.ky, source.kz};
-        result.workers = detail::worker_count(workers);
+        result.workers = detail::effective_workers(domain.cells[1] * domain.cells[2], workers);
         result.monitors = std::move(accumulators);
         result.elapsed_seconds = std::chrono::duration<double>(finish - start).count();
 
@@ -789,23 +807,40 @@ result<run_result> run_impl(const problem& value, const source_info& source,
 
 } // namespace
 
+result<void> validate(const problem& value) noexcept {
+    if (auto valid = validate(value.grid); !valid) return fail(valid.error());
+    if (value.materials.size() == 0) return fail(errc::missing_material);
+    if (auto valid = validate(value.geometry, value.materials); !valid) return fail(valid.error());
+    if (auto valid = validate(value.boundaries, value.grid); !valid) return fail(valid.error());
+    if (auto valid = validate(value.source); !valid) return fail(valid.error());
+    if (auto valid = validate(value.run); !valid) return fail(valid.error());
+
+    for (const auto& monitor : value.monitors) {
+        if (auto valid = validate(monitor, value.grid); !valid) return fail(valid.error());
+        const auto normal = static_cast<std::size_t>(monitor.normal);
+        if (in_cpml(value.boundaries, normal, monitor.index, value.grid.cells[normal]))
+            return fail(errc::monitor_inside_pml);
+    }
+    return {};
+}
+
 result<run_result> solve(const problem& value) noexcept {
-    return detail::guard([&]() -> result<run_result> {
-        if (auto valid = validate(value.grid); !valid) return fail(valid.error());
-        if (value.materials.size() == 0) return fail(errc::missing_material);
-        if (auto valid = validate(value.geometry, value.materials); !valid) return fail(valid.error());
-        if (auto valid = validate(value.boundaries, value.grid); !valid) return fail(valid.error());
-        if (auto valid = validate(value.source); !valid) return fail(valid.error());
-        if (auto valid = validate(value.run); !valid) return fail(valid.error());
+    detail::trace_span span(value.run.trace, "solve", LT_SOURCE);
+    auto outcome = detail::guard([&]() -> result<run_result> {
+        span.event("configuration", [&] { return litho::Fields{
+            litho::field("nx", value.grid.cells[0]), litho::field("ny", value.grid.cells[1]),
+            litho::field("nz", value.grid.cells[2]), litho::field("requested_workers", value.run.workers),
+            litho::field("monitors", value.monitors.size()),
+            litho::field("materials", value.materials.size()),
+            litho::field("dx", value.grid.spacing[0]), litho::field("dy", value.grid.spacing[1]),
+            litho::field("dz", value.grid.spacing[2]), litho::field("wavelength", value.source.wavelength),
+            litho::field("cpml_layers", value.boundaries.cpml.layers)}; }, LT_SOURCE);
+        if (auto valid = validate(value); !valid) return fail(valid.error());
 
-        for (const auto& monitor : value.monitors) {
-            if (auto valid = validate(monitor, value.grid); !valid) return fail(valid.error());
-            const auto normal = static_cast<std::size_t>(monitor.normal);
-            if (in_cpml(value.boundaries, normal, monitor.index, value.grid.cells[normal]))
-                return fail(errc::monitor_inside_pml);
-        }
-
-        auto map = voxelize(value.geometry, value.materials, value.grid);
+        auto map = [&] {
+            detail::trace_span stage(span.options(), "voxelize", LT_SOURCE);
+            return voxelize(value.geometry, value.materials, value.grid);
+        }();
         if (!map) return fail(map.error());
         auto source = make_source_info(value, *map);
         if (!source) return fail(source.error());
@@ -840,13 +875,25 @@ result<run_result> solve(const problem& value) noexcept {
 
         auto cpml = detail::make_cpml_set(value.grid, value.boundaries, dt);
         if (!cpml) return fail(cpml.error());
-        auto coefficients = build_coefficients(value, *map, dt);
+        auto coefficients = [&] {
+            detail::trace_span stage(span.options(), "coefficients", LT_SOURCE);
+            return build_coefficients(value, *map, dt);
+        }();
         if (!coefficients) return fail(coefficients.error());
 
+        span.event("prepared", [&] { return litho::Fields{
+            litho::field("dt", dt), litho::field("steps", steps),
+            litho::field("complex_fields", source->complex_mode),
+            litho::field("drude", coefficients->has_drude)}; }, LT_SOURCE);
         if (source->complex_mode)
-            return run_impl<complex>(value, *source, *cpml, *coefficients, dt, steps);
-        return run_impl<double>(value, *source, *cpml, *coefficients, dt, steps);
+            return run_impl<complex>(value, *source, *cpml, *coefficients, dt, steps, span.options());
+        return run_impl<double>(value, *source, *cpml, *coefficients, dt, steps, span.options());
     });
+    if (!outcome) span.failure(outcome.error(), LT_SOURCE);
+    else span.event("completed", [&] { return litho::Fields{
+        litho::field("loop_seconds", outcome->elapsed_seconds),
+        litho::field("steps", outcome->steps), litho::field("workers", outcome->workers)}; }, LT_SOURCE);
+    return outcome;
 }
 
 } // namespace litho::fdtd

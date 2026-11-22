@@ -1,4 +1,5 @@
 add_executable(litho_fdtd_tests
+    api_test.cpp
     geometry_test.cpp
     main.cpp
     material_test.cpp

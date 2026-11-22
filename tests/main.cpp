@@ -2,11 +2,13 @@
 
 #include <cstdio>
 
+void run_api_tests();
 void run_geometry_tests();
 void run_material_tests();
 void run_solver_tests();
 
 int main() {
+    run_api_tests();
     run_geometry_tests();
     run_material_tests();
     run_solver_tests();

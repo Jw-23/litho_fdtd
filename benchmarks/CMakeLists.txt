@@ -5,3 +5,6 @@ if(MSVC)
 else()
     target_compile_options(litho_fdtd_benchmark PRIVATE -Wall -Wextra -Wpedantic)
 endif()
+
+add_executable(litho_fdtd_spectrum_benchmark spectrum.cpp)
+target_link_libraries(litho_fdtd_spectrum_benchmark PRIVATE litho_fdtd)

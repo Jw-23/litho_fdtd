@@ -65,6 +65,7 @@ result<spectrum_result> compute_spectrum(const monitor_result& monitor, const sp
         const std::size_t order_count_y = static_cast<std::size_t>(options.max_order_y - options.min_order_y + 1);
         result.orders.reserve(order_count_x * order_count_y);
 
+        std::vector<complex> phase_x(nx);
         for (int n = options.min_order_y; n <= options.max_order_y; ++n) {
             const double ky = ky_incident + 2.0 * std::numbers::pi * static_cast<double>(n) / period_y;
             for (int m = options.min_order_x; m <= options.max_order_x; ++m) {
@@ -75,21 +76,29 @@ result<spectrum_result> compute_spectrum(const monitor_result& monitor, const sp
                 complex sum_ez{};
                 complex sum_hx{};
                 complex sum_hy{};
+                // Separate x/y phases and apply Yee offsets once per order.
+                // No transcendental functions remain in the cell loop.
+                for (std::size_t i = 0; i < nx; ++i)
+                    phase_x[i] = std::exp(complex{0.0, -kx * (monitor.origin[0] + i * dx)});
                 for (std::size_t j = 0; j < ny; ++j) {
-                    const double y = monitor.origin[1] + static_cast<double>(j) * dy;
+                    const complex phase_y = std::exp(complex{0.0, -ky * (monitor.origin[1] + j * dy)});
                     for (std::size_t i = 0; i < nx; ++i) {
-                        const double x = monitor.origin[0] + static_cast<double>(i) * dx;
                         const std::size_t plane_index = i + nx * j;
-                        // Each component is sampled at its own staggered position.
-                        sum_ex += ex[plane_index] * std::exp(complex{0.0, -1.0} * (kx * (x + 0.5 * dx) + ky * y));
-                        sum_ey += ey[plane_index] * std::exp(complex{0.0, -1.0} * (kx * x + ky * (y + 0.5 * dy)));
-                        sum_ez += ez[plane_index] *
-                                  std::exp(complex{0.0, -1.0} * (kx * (x + 0.5 * dx) + ky * (y + 0.5 * dy)));
-                        sum_hx += hx[plane_index] * std::exp(complex{0.0, -1.0} * (kx * x + ky * (y + 0.5 * dy)));
-                        sum_hy += hy[plane_index] *
-                                  std::exp(complex{0.0, -1.0} * (kx * (x + 0.5 * dx) + ky * y));
+                        const complex phase = phase_x[i] * phase_y;
+                        sum_ex += ex[plane_index] * phase;
+                        sum_ey += ey[plane_index] * phase;
+                        sum_ez += ez[plane_index] * phase;
+                        sum_hx += hx[plane_index] * phase;
+                        sum_hy += hy[plane_index] * phase;
                     }
                 }
+                const complex offset_x = std::exp(complex{0.0, -0.5 * kx * dx});
+                const complex offset_y = std::exp(complex{0.0, -0.5 * ky * dy});
+                sum_ex *= offset_x;
+                sum_ey *= offset_y;
+                sum_ez *= offset_x * offset_y;
+                sum_hx *= offset_y;
+                sum_hy *= offset_x;
                 const double norm = 1.0 / static_cast<double>(nx * ny);
                 const std::array<complex, 3> field{sum_ex * norm, sum_ey * norm, sum_ez * norm};
 
