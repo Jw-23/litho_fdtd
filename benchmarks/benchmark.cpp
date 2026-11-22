@@ -22,6 +22,7 @@ int main(int argc, char** argv) {
     value.source.pulse_fwhm = 1.0;
     value.run.steps = 300;
     value.run.workers = argc > 1 ? static_cast<std::size_t>(std::strtoull(argv[1], nullptr, 10)) : 0;
+    if (argc > 4) value.run.chunk_rows = static_cast<std::size_t>(std::strtoull(argv[4], nullptr, 10));
 
     // Optional monitor workload and a fresh tracing directory. The trace
     // directory may be the second argument when no monitor workload is used.
@@ -36,6 +37,7 @@ int main(int argc, char** argv) {
         }
     }
     const char* trace_directory = argc > 3 ? argv[3] : (argc > 2 && mode != "monitors" ? argv[2] : nullptr);
+    if (trace_directory && *trace_directory == '\0') trace_directory = nullptr;
     std::optional<litho::Session> trace;
     if (trace_directory) {
         litho::Options options;

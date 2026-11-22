@@ -22,7 +22,8 @@ The public namespace is `litho::fdtd`. The library follows the same conventions 
   efficiencies, and incident-normalized spectra.
 - 3D mask geometry through `litho_geometry::common::extrusion` and `box3` solids, voxelized one
   z slice at a time.
-- Structure-of-arrays storage, slice-oriented update loops, and a chunk scheduler from the sibling `parallel` project.
+- Structure-of-arrays storage, fused H/E scheduler phases, and a chunk scheduler from the sibling
+  `parallel` project; field kernels use at most four performance cores.
 
 ## Build
 
@@ -89,7 +90,8 @@ p.source.wavelength = 193e-9;
 p.source.polarization = 0;   // 0 = s (TE), pi/2 = p (TM)
 p.source.pulse_fwhm = 0.5;   // optical periods
 p.run.duration = 20;         // optical periods
-p.run.workers = 0;           // 0 = hardware concurrency, 1 = serial
+p.run.workers = 0;           // 0 = four performance cores (capped at 4)
+p.run.chunk_rows = 128;      // scheduler grain in rows
 
 p.monitor_z = 450e-9;        // in air, above the absorber
 p.spectrum.min_order_x = -6;
@@ -266,7 +268,7 @@ orders, normalized orders, incident power, and total transmitted efficiency.
 - The high-level mask-spectrum API against the low-level grating result.
 - A Drude absorber run with bounded, finite output.
 
-The test suite passes in Release in about 6 seconds on the development machine; Debug is slower
+The test suite passes in Release in about 4–6 seconds on the development machine; Debug is slower
 because the update kernels are not optimized.
 
 ## Performance and memory
@@ -278,14 +280,20 @@ complex (Bloch) run, field and CPML arrays use `std::complex<double>`.
 Update kernels are dispatched through `parallel::for_each_chunk` from the sibling `parallel`
 work-stealing scheduler. The scheduler splits the z×y rows into cache-sized chunks; the calling
 thread participates, and an idle team is reused between updates from the same thread.
-`run_options::workers = 0` uses hardware concurrency, `1` runs inline, and larger values cap the
-team. An explicit value greater than one is honored even for a small grid; automatic mode keeps
-tiny work inline. Monitor accumulation and the adaptive material setup remain single-threaded
-because they are small compared with the field updates. No OpenMP runtime or build option is used.
+`run_options::workers = 0` selects the four performance cores, `1` runs inline, and explicit values
+are capped at four so macOS efficiency cores do not enter the field kernel. `run_options::chunk_rows`
+sets the scheduler grain in rows (default 128; `0` uses the framework default). Monitor accumulation
+and material setup remain single-threaded because they are small compared with the field updates.
+No OpenMP runtime or build option is used.
 
-On the development machine, the included benchmark measured about 93 Mcell-updates/s with one
-worker, 223 with four, and 260 with ten (Release, 120×120×240 grid, 300 steps). For large masks,
-memory is usually the limiting factor; use a grid just large enough for the pulse and the CPML.
+H and E updates are fused into two scheduler phases per time step: all three H components share one
+parallel region, then all three E components share one. CPML auxiliary variables are read and
+written only inside the PML layers; outside, the derivative is the plain Yee stencil.
+
+On the development machine, the included benchmark measured about 126 Mcell-updates/s with one
+worker and 317 with four (Release, 120×120×240 grid, 300 steps, 193 nm vacuum), a 2.5× speedup.
+For large masks, shared memory bandwidth is usually the limiting factor; use a grid just large
+enough for the pulse and the CPML.
 
 ## Limitations
 
@@ -347,7 +355,7 @@ configuration, preparation, completion, errors, and stage spans: mask spectrum,
 reference/patterned runs, solve, voxelization, coefficients, initialization, time
 loop, and postprocessing. Category `fdtd.step` records each block and its progress.
 Category `fdtd.kernel` records one span per update component
-(`update_hx` … `update_ez`) and monitor accumulation on **the first step of each
+(`update_h`, `update_e`) and monitor accumulation on **the first step of each
 block**. Every such span carries a `summary` instant with:
 
 | Field | Meaning |
@@ -395,26 +403,28 @@ tracing disabled):
 | 120×120×240, 300 steps, 4 workers, three four-frequency monitors, median of three loops | 4.553 s | 4.254 s |
 
 These correspond to about 5.9× faster spectrum extraction and 6.6% less time in
-the monitored loop, rather than a universal field-kernel speedup.
+the monitored loop, rather than a universal field-kernel speedup. The field-loop
+entry predates the H/E fusion and chunk experiments below.
 
-A separate wait analysis used the same 120×120×240, 300-step vacuum grid with no
-monitors and `step_interval = 1`, `detail_steps = 1`:
+The optimized four-worker loop was measured against the pre-fusion trace on the same
+120×120×240, 300-step vacuum grid with no monitors (`step_interval = 1`, `detail_steps = 1`):
 
-| Workers | Loop time | Step-0 phase work | Worker utilization | Worker idle | Main-thread wait |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 12.11 s | 42.2 ms | 1.00 | ~0% | ~0% |
-| 4 | 4.63 s | 57.1 ms | 0.805 | 19.5% | 0.7–1.2% |
-| 10 | 4.03 s | 98.3 ms | 0.644 | 35.6% | 1.4–2.1% |
+| Configuration (4 workers) | Loop time | Step-0 phase work | Worker utilization | Worker idle |
+| --- | ---: | ---: | ---: | ---: |
+| Before: 6 phases, full-grid CPML, 64-row grain | 4.63 s | 57.1 ms | 0.805 | 19.5% |
+| Fused H/E, boundary-only CPML, 64-row grain | 3.27 s | 40.9 ms | 0.924 | 7.6% |
+| Same, 128-row grain (default) | 3.28 s | 44.0 ms | 0.956 | 4.4% |
+| Same, 256-row grain | 3.29 s | 43.5 ms | 0.969 | 3.1% |
+| Same, 512-row grain | 3.36 s | 42.5 ms | 0.976 | 2.4% |
 
-The four-worker step-0 speedup is `4 * 0.805 / 1.35 = 2.39`, matching the measured
-~2.4×: total work grew 1.35× because concurrent workers lose per-core throughput,
-and workers are idle for about 20% of the phase at batch boundaries and the
-barrier tail. The main thread itself waits only ~1%; the wait is on the workers,
-not in serial monitor work. At ten workers the work grows 2.33× and utilization
-falls to 0.644, so throughput only reaches ~2.8×; the extra threads include
-efficiency cores and increase memory/cache pressure. Traced runs wrote
-7,230–12,654 events with zero drops; the panel exposes the per-worker chunk
-intervals and the barrier tail. These numbers are hardware-specific.
+The serial loop dropped from 12.11 s before fusion to 8.30 s with one worker. The four-worker
+step-0 speedup is `4 * 0.956 / 1.56 = 2.45`, matching the measured ~2.5×: fusion and boundary-only
+CPML reduced absolute work, but concurrent workers still inflate total work by 1.56× because of
+memory/cache bandwidth and per-core throughput. Larger grains reduce worker idle (19.5% → 4.4% →
+2.4%) but do not improve wall time once the tail becomes coarse; 128 rows is the default balance.
+The main thread itself waits only a few percent; the earlier waiting was on workers at phase
+boundaries. Traced runs wrote 3,622–5,430 events with zero drops. These numbers are
+hardware-specific.
 
 For future batch workloads, reference-spectrum reuse and prepared grid/material
 coefficients are useful candidates. The current high-level API still voxelizes

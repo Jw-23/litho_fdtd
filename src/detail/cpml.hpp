@@ -9,6 +9,7 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <utility>
 #include <vector>
 
@@ -23,6 +24,7 @@ struct cpml_axis {
     double spacing = 0;
     std::vector<double> inv_kappa_int, b_e_int, c_e_int, b_h_int, c_h_int;
     std::vector<double> inv_kappa_half, b_e_half, c_e_half, b_h_half, c_h_half;
+    std::vector<std::uint8_t> pml_int, pml_half;
 };
 
 struct cpml_set {
@@ -35,6 +37,7 @@ struct profile {
     double sigma = 0;
     double kappa = 1;
     double alpha = 0;
+    bool active = false;
 };
 
 inline profile sample(double coordinate, double length, double thickness, const cpml_options& options,
@@ -50,6 +53,7 @@ inline profile sample(double coordinate, double length, double thickness, const 
     out.sigma = sigma_max * graded;
     out.kappa = 1.0 + (options.kappa_max - 1.0) * graded;
     out.alpha = options.alpha_max * sigma_max * (1.0 - u);
+    out.active = depth > 0;
     return out;
 }
 
@@ -97,13 +101,18 @@ inline coefficients make_coefficients(const profile& p, double dt) noexcept {
     out.c_e_half.resize(n);
     out.b_h_half.resize(n);
     out.c_h_half.resize(n);
+    out.pml_int.resize(n);
+    out.pml_half.resize(n);
 
     for (std::size_t i = 0; i < n; ++i) {
-        const auto node = cpml_detail::make_coefficients(
-            cpml_detail::sample(static_cast<double>(i) * out.spacing, length, thickness, bc.cpml, sigma_max), dt);
-        const auto half = cpml_detail::make_coefficients(
-            cpml_detail::sample((static_cast<double>(i) + 0.5) * out.spacing, length, thickness, bc.cpml, sigma_max),
-            dt);
+        const auto node_profile = cpml_detail::sample(static_cast<double>(i) * out.spacing, length, thickness,
+                                                      bc.cpml, sigma_max);
+        const auto half_profile = cpml_detail::sample((static_cast<double>(i) + 0.5) * out.spacing, length,
+                                                      thickness, bc.cpml, sigma_max);
+        const auto node = cpml_detail::make_coefficients(node_profile, dt);
+        const auto half = cpml_detail::make_coefficients(half_profile, dt);
+        out.pml_int[i] = node_profile.active ? 1 : 0;
+        out.pml_half[i] = half_profile.active ? 1 : 0;
         out.inv_kappa_int[i] = node.inv_kappa;
         out.b_e_int[i] = node.b_e;
         out.c_e_int[i] = node.c_e;

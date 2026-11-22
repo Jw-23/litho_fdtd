@@ -17,9 +17,14 @@
 
 namespace litho::fdtd::detail {
 
+// Apple silicon has four performance cores and six efficiency cores. Keep the
+// field solver on the performance cluster by default; explicit larger requests
+// are capped as well.
+inline constexpr std::size_t max_workers = 4;
+
 [[nodiscard]] inline std::size_t worker_count(std::size_t workers) noexcept {
-    if (workers != 0) return workers;
-    return std::max<std::size_t>(1, std::thread::hardware_concurrency());
+    if (workers == 0) workers = std::max<std::size_t>(1, std::thread::hardware_concurrency());
+    return std::min(max_workers, std::max<std::size_t>(1, workers));
 }
 
 [[nodiscard]] inline std::size_t effective_workers(std::size_t chunks, std::size_t workers) noexcept {
@@ -37,10 +42,10 @@ namespace litho::fdtd::detail {
 // chunks; utilization distinguishes barrier/idle time from memory contention.
 // Chunk spans are emitted only for the first trace.detail_steps sampled steps.
 template<class Body>
-[[nodiscard]] result<void> parallel_for(std::size_t chunks, std::size_t workers, const char* phase,
-                                        trace_options trace, std::size_t step, Body&& body) {
-    if (chunks == 0) return {};
-    const std::size_t actual = effective_workers(chunks, workers);
+[[nodiscard]] result<void> parallel_for(std::size_t work_items, std::size_t workers, std::size_t chunk_rows,
+                                        const char* phase, trace_options trace, std::size_t step, Body&& body) {
+    if (work_items == 0) return {};
+    const std::size_t actual = effective_workers(work_items, workers);
     auto map_error = [](const parallel::Result<void>& status) -> result<void> {
         if (!status) {
             if (status.error() == std::errc::not_enough_memory) return fail(errc::allocation_failure);
@@ -49,7 +54,7 @@ template<class Body>
         return {};
     };
     if (!trace.session)
-        return map_error(parallel::for_each_chunk(chunks, actual, std::forward<Body>(body)));
+        return map_error(parallel::for_each_chunk(work_items, actual, std::forward<Body>(body), chunk_rows));
 
     detail::trace_span phase_span(trace, phase, LT_SOURCE, "fdtd.kernel");
     const bool detailed = step < trace.detail_steps;
@@ -59,7 +64,7 @@ template<class Body>
     std::atomic<std::uint64_t> total_work_ns{0};
     std::atomic<std::size_t> chunk_count{0};
 
-    auto status = parallel::for_each_chunk(chunks, actual, [&](std::size_t first, std::size_t last) {
+    auto status = parallel::for_each_chunk(work_items, actual, [&](std::size_t first, std::size_t last) {
         if (detailed) {
             detail::trace_span chunk_span(phase_span.options(), "chunk", LT_SOURCE, "fdtd.chunk");
             const auto chunk_start = std::chrono::steady_clock::now();
@@ -81,7 +86,7 @@ template<class Body>
         } else {
             body(first, last);
         }
-    });
+    }, chunk_rows);
 
     const auto wall_ns = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
@@ -97,7 +102,7 @@ template<class Body>
         [&] {
             return litho::Fields{litho::field("step", static_cast<std::uint64_t>(step)),
                                  litho::field("workers", static_cast<std::uint64_t>(actual)),
-                                 litho::field("items", static_cast<std::uint64_t>(chunks)),
+                                 litho::field("items", static_cast<std::uint64_t>(work_items)),
                                  litho::field("wall_ns", wall_ns),
                                  litho::field("main_work_ns", main_work_ns),
                                  litho::field("wait_ns", wait_ns),

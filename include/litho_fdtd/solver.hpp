@@ -20,7 +20,8 @@ struct run_options {
     double courant = 0.95; // Courant number, must be in (0, 1]
     double duration = 60;  // optical periods when `steps` is unset
     std::optional<std::size_t> steps;
-    std::size_t workers = 0; // 0 uses hardware concurrency
+    std::size_t workers = 0;     // 0 uses the four performance cores; explicit values are capped at 4
+    std::size_t chunk_rows = 128; // rows per scheduler grain; 0 uses the framework default
     trace_options trace;
 };
 

@@ -33,7 +33,8 @@ void plane_wave_vacuum() {
     value.source.polarization = 0;
     value.source.pulse_fwhm = 1.0;
     value.run.duration = 10;
-    value.run.workers = 4;
+    value.run.workers = 10; // capped to the four performance cores
+    value.run.chunk_rows = 128;
 
     monitor detector;
     detector.name = "vacuum";
