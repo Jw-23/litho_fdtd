@@ -17,9 +17,8 @@
 
 namespace litho::fdtd::detail {
 
-// Apple silicon has four performance cores and six efficiency cores. Keep the
-// field solver on the performance cluster by default; explicit larger requests
-// are capped as well.
+// Match the development M4's four performance cores with a four-worker budget.
+// This is a thread-count limit, not CPU affinity: the OS still chooses cores.
 inline constexpr std::size_t max_workers = 4;
 
 [[nodiscard]] inline std::size_t worker_count(std::size_t workers) noexcept {

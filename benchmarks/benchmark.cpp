@@ -27,6 +27,19 @@ int main(int argc, char** argv) {
     // Optional monitor workload and a fresh tracing directory. The trace
     // directory may be the second argument when no monitor workload is used.
     const std::string mode = argc > 2 ? argv[2] : "";
+    const bool named_mode = mode == "monitors" || mode == "patterned" || mode == "oblique";
+    if (mode == "patterned" || mode == "oblique") {
+        (void)value.materials.add(material{"lossy magnetic dielectric", 2.25, 1400, 1.3, std::nullopt});
+        auto rectangle = common::rectangle(common::box<double, 2>{{0, 0}, {300e-9, 300e-9}});
+        if (!rectangle) return 1;
+        auto solid = common::make_extrusion(*rectangle, 750e-9, 900e-9, 1.0);
+        if (!solid) return 1;
+        value.geometry.solids.push_back(patterned_solid{*solid, 1});
+        if (mode == "oblique") {
+            value.source.theta = 0.25;
+            value.source.phi = 0.4;
+        }
+    }
     if (mode == "monitors") {
         for (std::size_t index : {100u, 140u, 180u}) {
             monitor detector;
@@ -36,7 +49,7 @@ int main(int argc, char** argv) {
             value.monitors.push_back(std::move(detector));
         }
     }
-    const char* trace_directory = argc > 3 ? argv[3] : (argc > 2 && mode != "monitors" ? argv[2] : nullptr);
+    const char* trace_directory = argc > 3 ? argv[3] : (argc > 2 && !named_mode ? argv[2] : nullptr);
     if (trace_directory && *trace_directory == '\0') trace_directory = nullptr;
     std::optional<litho::Session> trace;
     if (trace_directory) {
@@ -56,6 +69,7 @@ int main(int argc, char** argv) {
         value.run.trace.step_interval = 1;
         value.run.trace.detail_steps = 1;
     }
+    std::printf("workload %s, chunk_rows %zu\n", named_mode ? mode.c_str() : "vacuum", value.run.chunk_rows);
     const auto wall_start = std::chrono::steady_clock::now();
     auto result = solve(value);
     if (!result) {

@@ -23,7 +23,7 @@ The public namespace is `litho::fdtd`. The library follows the same conventions 
 - 3D mask geometry through `litho_geometry::common::extrusion` and `box3` solids, voxelized one
   z slice at a time.
 - Structure-of-arrays storage, fused H/E scheduler phases, and a chunk scheduler from the sibling
-  `parallel` project; field kernels use at most four performance cores.
+  `parallel` project; field kernels use at most four workers.
 
 ## Build
 
@@ -58,7 +58,16 @@ cmake --build --preset release
 ```
 
 The benchmark reports million cell-updates per second for a 120×120×240 vacuum grid; the optional
-`workers` argument follows `run_options::workers`.
+`workers` argument follows `run_options::workers`. An optional second argument selects `monitors`
+(three four-frequency monitors), `patterned` (a lossy magnetic dielectric pattern), or `oblique`
+(the same pattern with complex Bloch fields):
+
+```sh
+./build/release/benchmarks/litho_fdtd_benchmark 4 patterned
+./build/release/benchmarks/litho_fdtd_benchmark 4 oblique
+# Empty trace directory, then the scheduler grain in rows:
+./build/release/benchmarks/litho_fdtd_benchmark 4 patterned "" 128
+```
 
 ## Quick start: a 193 nm line/space mask
 
@@ -90,7 +99,7 @@ p.source.wavelength = 193e-9;
 p.source.polarization = 0;   // 0 = s (TE), pi/2 = p (TM)
 p.source.pulse_fwhm = 0.5;   // optical periods
 p.run.duration = 20;         // optical periods
-p.run.workers = 0;           // 0 = four performance cores (capped at 4)
+p.run.workers = 0;           // 0 = up to four workers (no CPU pinning)
 p.run.chunk_rows = 128;      // scheduler grain in rows
 
 p.monitor_z = 450e-9;        // in air, above the absorber
@@ -280,8 +289,9 @@ complex (Bloch) run, field and CPML arrays use `std::complex<double>`.
 Update kernels are dispatched through `parallel::for_each_chunk` from the sibling `parallel`
 work-stealing scheduler. The scheduler splits the z×y rows into cache-sized chunks; the calling
 thread participates, and an idle team is reused between updates from the same thread.
-`run_options::workers = 0` selects the four performance cores, `1` runs inline, and explicit values
-are capped at four so macOS efficiency cores do not enter the field kernel. `run_options::chunk_rows`
+`run_options::workers = 0` selects up to four workers, `1` runs inline, and explicit values
+are capped at four. This limits thread count without pinning CPUs; macOS still chooses performance
+or efficiency cores according to system load. `run_options::chunk_rows`
 sets the scheduler grain in rows (default 128; `0` uses the framework default). Monitor accumulation
 and material setup remain single-threaded because they are small compared with the field updates.
 No OpenMP runtime or build option is used.
@@ -290,10 +300,41 @@ H and E updates are fused into two scheduler phases per time step: all three H c
 parallel region, then all three E components share one. CPML auxiliary variables are read and
 written only inside the PML layers; outside, the derivative is the plain Yee stencil.
 
-On the development machine, the included benchmark measured about 130 Mcell-updates/s with one
-worker and 344 with four (Release, 120×120×240 grid, 300 steps, 193 nm vacuum), a 2.6× speedup.
-For large masks, shared memory bandwidth is usually the limiting factor; use a grid just large
-enough for the pulse and the CPML.
+Two costs limit four-worker scaling: shared cache/memory traffic, and boundary/CPML/material
+branches that obstruct SIMD in the general stencil. Earlier tracing already showed about 95.6%
+worker utilization; increasing the grain mainly reduced a small amount of waiting. Compiler
+remarks confirmed that the original six component loops were not vectorized.
+
+Material coefficients now use lossless row packing: an x-uniform row stores one double, a patterned
+row retains every value, and mixed layouts are decoded once per row. The vacuum benchmark's nine
+coefficient arrays shrink from 248.8 MB to 2.07 MB. Wrapped cells and x CPML edges retain the general
+kernel; y/z CPML state and row coefficients are selected before entering the contiguous bulk loop,
+allowing SIMD for real fields. Drude electric updates retain the general formula. The public API
+and floating-point accuracy settings are unchanged.
+
+Apple M4, AppleClang 21, Release, 120×120×240, 300 steps, 128-row grain, tracing off.
+Each configuration ran three times with old/new versions alternating sequentially; median loop times:
+
+| Workload | Workers | Before | After | Speed relative to old version |
+| --- | ---: | ---: | ---: | ---: |
+| Vacuum, real fields | 1 | 15.006 s | 6.128 s | 2.45× |
+| Vacuum, real fields | 4 | 4.909 s | 2.625 s | 1.87× |
+| Lossy magnetic dielectric pattern, real fields | 4 | 4.863 s | 2.660 s | 1.83× |
+| Same pattern, oblique complex fields | 4 | 8.010 s | 8.070 s | 0.99× (no stable gain) |
+
+These reruns were contended: a separate FDTD test/benchmark workload and desktop applications were
+active on the same machine. They include extra scheduling and bandwidth competition and do not
+represent idle-machine peak throughput. Four-worker vacuum loop ranges were 4.631–5.600 s before
+and 2.204–3.078 s after; median whole-solve times were 5.037 → 2.791 s. Earlier lighter-load runs
+reproduced the original ~7.9 s single-worker and ~3.0 s four-worker results, matching the reported
+~2.6× thread speedup. No stable improvement was measured for oblique complex fields in this round.
+
+Compute thread speedup against the single-worker time of the same version. Faster single-core
+SIMD can reduce that ratio while still substantially reducing elapsed time. The remaining scaling
+limit is consistent with shared data bandwidth; hardware counters have not separately quantified
+DRAM and cache effects. Numerical regressions cover real/complex fields, layered/patterned media,
+conductivity, magnetism, all-axis/mixed CPML, Drude and narrow grids, including pre-optimization
+numerical signatures and identical serial/parallel outputs.
 
 ## Limitations
 
@@ -406,7 +447,8 @@ These correspond to about 5.9× faster spectrum extraction and 6.6% less time in
 the monitored loop, rather than a universal field-kernel speedup. The field-loop
 entry predates the H/E fusion and chunk experiments below.
 
-The optimized four-worker loop was measured against the pre-fusion trace on the same
+The following historical H/E fusion measurements predate the row packing and SIMD optimization above.
+The fused four-worker loop was measured against the pre-fusion trace on the same
 120×120×240, 300-step vacuum grid with no monitors (`step_interval = 1`, `detail_steps = 1`):
 
 | Configuration (4 workers) | Loop time | Step-0 phase work | Worker utilization | Worker idle |

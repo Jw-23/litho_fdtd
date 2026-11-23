@@ -1,4 +1,5 @@
 #include "test_support.hpp"
+#include "solver_regression.hpp"
 
 #include <litho_fdtd/fdtd.hpp>
 
@@ -33,7 +34,7 @@ void plane_wave_vacuum() {
     value.source.polarization = 0;
     value.source.pulse_fwhm = 1.0;
     value.run.duration = 10;
-    value.run.workers = 10; // capped to the four performance cores
+    value.run.workers = 10; // capped to four workers
     value.run.chunk_rows = 128;
 
     monitor detector;
@@ -312,6 +313,46 @@ void drude_absorber() {
     CHECK(order->power < 1e-4);
 }
 
+void kernel_numerical_regression() {
+    // Weighted complex sum and squared norm over every monitor value, captured
+    // from the original scalar stencil before coefficient/SIMD optimization.
+    // Cases cover uniform/layered/dense coefficients, conductivity, magnetic
+    // media, real/complex fields, all-axis/mixed CPML, Drude and nx=1 tails.
+    constexpr std::array<std::array<double, 3>, 9> expected{{
+        {-683.80316124165893, -20.35877233044372, 13285.09443270675},
+        {309.99128437582033, -772.23237906938527, 9400.7879284031878},
+        {-281.25426479890552, -331.33247128673821, 10002.450725123086},
+        {1.6741840803584667, -336.48830479489141, 9669.9311714269224},
+        {64.938170524837872, 385.12844020351736, 9025.8615069644111},
+        {-172.44344156408638, -162.74758219847234, 12643.678276882969},
+        {-1038.1176185759059, -132.75847187516118, 15408.753785101804},
+        {-303.22520753418519, -694.13018840360598, 7672.7759814867859},
+        {-30.86901625092003, -70.611798572110828, 1276.5983570696249},
+    }};
+    for (std::size_t scenario = 0; scenario < expected.size(); ++scenario) {
+        auto p = kernel_regression_problem(scenario);
+        const auto serial = solve(p);
+        CHECK(serial.has_value());
+        if (!serial) continue;
+        std::complex<double> checksum{};
+        double squared_norm = 0;
+        std::size_t index = 0;
+        for (const auto& m : serial->monitors)
+            for (const auto v : m.values) {
+                checksum += v * (1.0 + static_cast<double>((index++ * 17) % 101) / 101.0);
+                squared_norm += std::norm(v);
+            }
+        CHECK_COMPLEX_NEAR(checksum, std::complex<double>(expected[scenario][0], expected[scenario][1]), 1e-10);
+        CHECK_NEAR(squared_norm, expected[scenario][2], 1e-10);
+        p.run.workers = 4;
+        const auto parallel = solve(p);
+        CHECK(parallel.has_value());
+        if (!parallel) continue;
+        for (std::size_t m = 0; m < serial->monitors.size(); ++m)
+            CHECK(serial->monitors[m].values == parallel->monitors[m].values);
+    }
+}
+
 } // namespace
 
 void run_solver_tests() {
@@ -322,4 +363,5 @@ void run_solver_tests() {
     grating_energy();
     mask_spectrum_api();
     drude_absorber();
+    kernel_numerical_regression();
 }

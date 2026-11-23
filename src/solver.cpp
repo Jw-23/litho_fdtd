@@ -23,6 +23,12 @@ namespace litho::fdtd {
 
 namespace {
 
+#if defined(_MSC_VER)
+#define LITHO_FDTD_RESTRICT __restrict
+#else
+#define LITHO_FDTD_RESTRICT __restrict__
+#endif
+
 using complex = std::complex<double>;
 
 template<class Scalar>
@@ -46,12 +52,71 @@ struct dispersion_state {
     std::vector<Scalar> jx, jy, jz;
 };
 
+// Pack x-uniform coefficient rows into one scalar each. Patterned rows keep
+// every value, so compression is lossless even for conductive/magnetic masks.
+// Purely dense and purely uniform arrays need no per-row layout table.
+class coefficient_array {
+public:
+    void resize(std::size_t count) { values_.resize(count); }
+    void assign(std::size_t count, double value) { values_.assign(count, value); }
+    double& operator[](std::size_t index) { return values_[index]; }
+
+    void compress_rows(std::size_t nx) {
+        const std::size_t rows = values_.size() / nx;
+        const auto uniform = [&](std::size_t first) {
+            for (std::size_t i = 1; i < nx; ++i)
+                if (values_[first + i] != values_[first]) return false;
+            return true;
+        };
+        std::size_t uniform_count = 0;
+        for (std::size_t first = 0; first < values_.size(); first += nx)
+            if (uniform(first)) ++uniform_count;
+        if (uniform_count == 0) return;
+        uniform_rows_ = uniform_count == rows;
+        if (!uniform_rows_) row_offsets_.resize(rows);
+        std::vector<double> compact;
+        compact.reserve(uniform_count + (rows - uniform_count) * nx);
+        for (std::size_t row = 0; row < rows; ++row) {
+            const std::size_t first = row * nx;
+            const bool dense = !uniform_rows_ && !uniform(first);
+            // Low bit marks a dense row; grid validation bounds the packed
+            // offset below half of size_t's range.
+            if (!uniform_rows_) row_offsets_[row] = (compact.size() << 1) | static_cast<std::size_t>(dense);
+            const std::size_t width = dense ? nx : 1;
+            compact.insert(compact.end(), values_.data() + first, values_.data() + first + width);
+        }
+        values_.swap(compact);
+    }
+
+    struct row_view {
+        const double* dense;
+        double constant;
+        double operator[](std::size_t i) const noexcept { return dense ? dense[i] : constant; }
+        row_view offset(std::size_t first) const noexcept {
+            return {dense ? dense + first : nullptr, constant};
+        }
+    };
+    row_view row(std::size_t row, std::size_t nx) const noexcept {
+        if (uniform_rows_) return {nullptr, values_[row]};
+        if (!row_offsets_.empty()) {
+            const std::size_t layout = row_offsets_[row];
+            const double* data = values_.data() + (layout >> 1);
+            return (layout & 1) ? row_view{data, 0} : row_view{nullptr, *data};
+        }
+        return {values_.data() + row * nx, 0};
+    }
+private:
+    std::vector<double> values_;
+    std::vector<std::size_t> row_offsets_;
+    bool uniform_rows_ = false;
+};
+
 struct material_coefficients {
-    std::array<std::vector<double>, 3> ca; // Ex, Ey, Ez
-    std::array<std::vector<double>, 3> cb;
-    std::array<std::vector<double>, 3> h_cb; // Hx, Hy, Hz
-    std::array<std::vector<double>, 3> drude_a;
-    std::array<std::vector<double>, 3> drude_b;
+    std::array<coefficient_array, 3> ca; // Ex, Ey, Ez
+    std::array<coefficient_array, 3> cb;
+    std::array<coefficient_array, 3> h_cb; // Hx, Hy, Hz
+    std::array<coefficient_array, 3> drude_a;
+    std::array<coefficient_array, 3> drude_b;
     bool has_drude = false;
 };
 
@@ -101,6 +166,104 @@ Scalar diff_forward(const Scalar* data, std::size_t index, std::size_t stride, s
     return (data[index] - data[index - stride]) * inverse_spacing;
 }
 
+// CPML coefficients are constant across a y/z row. Select its active
+// stretches once, so neither periodicity nor PML tests occur in the SIMD loop.
+template<class Scalar>
+struct row_stretch {
+    Scalar* memory = nullptr;
+    double inverse_kappa = 1, b = 0, c = 0;
+};
+
+template<class Scalar>
+row_stretch<Scalar> make_row_stretch(std::vector<Scalar>& memory, const detail::cpml_axis& axis,
+                                    std::size_t coordinate, std::size_t base, bool electric) {
+    if (axis.periodic) return {};
+    if (electric) {
+        if (!axis.pml_int[coordinate]) return {};
+        return {memory.data() + base, axis.inv_kappa_int[coordinate],
+                axis.b_e_int[coordinate], axis.c_e_int[coordinate]};
+    }
+    if (!axis.pml_half[coordinate]) return {};
+    return {memory.data() + base, axis.inv_kappa_half[coordinate],
+            axis.b_h_half[coordinate], axis.c_h_half[coordinate]};
+}
+
+// Input, output, and auxiliary fields occupy separate allocations. Keep the
+// wrapped boundary cells in the general kernel and expose a simple
+// contiguous loop for the bulk of each row. No relaxed floating-point flags
+// or approximated material coefficients are needed.
+template<bool Electric, bool Uniform, bool PmlA, bool PmlB, class Scalar>
+void update_bulk_row(Scalar* LITHO_FDTD_RESTRICT target,
+                     const Scalar* high_a, const Scalar* low_a,
+                     const Scalar* high_b, const Scalar* low_b,
+                     double inverse_a, double inverse_b,
+                     coefficient_array::row_view ca, coefficient_array::row_view cb,
+                     row_stretch<Scalar> stretch_a, row_stretch<Scalar> stretch_b,
+                     std::size_t first, std::size_t last) {
+    Scalar* LITHO_FDTD_RESTRICT psi_a = stretch_a.memory;
+    Scalar* LITHO_FDTD_RESTRICT psi_b = stretch_b.memory;
+    for (std::size_t i = first; i < last; ++i) {
+        Scalar a = (high_a[i] - low_a[i]) * inverse_a;
+        Scalar b = (high_b[i] - low_b[i]) * inverse_b;
+        if constexpr (PmlA) {
+            const Scalar previous = psi_a[i];
+            psi_a[i] = stretch_a.b * previous + stretch_a.c * a;
+            a = a * stretch_a.inverse_kappa + previous;
+        }
+        if constexpr (PmlB) {
+            const Scalar previous = psi_b[i];
+            psi_b[i] = stretch_b.b * previous + stretch_b.c * b;
+            b = b * stretch_b.inverse_kappa + previous;
+        }
+        const Scalar curl = a - b;
+        const double coefficient_b = Uniform ? cb.constant : cb[i];
+        if constexpr (Electric) {
+            const double coefficient_a = Uniform ? ca.constant : ca[i];
+            target[i] = coefficient_a * target[i] + coefficient_b * curl;
+        } else {
+            target[i] += coefficient_b * curl;
+        }
+    }
+}
+
+template<bool Electric, class Scalar>
+void update_bulk_row(Scalar* target, const Scalar* high_a, const Scalar* low_a,
+                     const Scalar* high_b, const Scalar* low_b,
+                     double inverse_a, double inverse_b,
+                     coefficient_array::row_view ca, coefficient_array::row_view cb,
+                     row_stretch<Scalar> stretch_a, row_stretch<Scalar> stretch_b,
+                     std::size_t first, std::size_t last) {
+    const auto dispatch = [&]<bool PmlA, bool PmlB>() {
+        if (!ca.dense && !cb.dense)
+            update_bulk_row<Electric, true, PmlA, PmlB>(target, high_a, low_a, high_b, low_b,
+                inverse_a, inverse_b, ca, cb, stretch_a, stretch_b, first, last);
+        else
+            update_bulk_row<Electric, false, PmlA, PmlB>(target, high_a, low_a, high_b, low_b,
+                inverse_a, inverse_b, ca, cb, stretch_a, stretch_b, first, last);
+    };
+    if (stretch_a.memory) {
+        if (stretch_b.memory) dispatch.template operator()<true, true>();
+        else dispatch.template operator()<true, false>();
+    } else {
+        if (stretch_b.memory) dispatch.template operator()<false, true>();
+        else dispatch.template operator()<false, false>();
+    }
+}
+
+// Only x derivatives need individual boundary cells inside a row. Exclude
+// those and any x CPML nodes from the SIMD interval; the general kernel handles
+// the remaining cells with the original staggered/boundary conventions.
+std::pair<std::size_t, std::size_t> bulk_x_range(const detail::cpml_axis& axis, bool electric) {
+    std::size_t first = electric ? 1 : 0;
+    std::size_t last = axis.count - (electric ? 0 : 1);
+    if (!axis.periodic) {
+        const auto& active = electric ? axis.pml_int : axis.pml_half;
+        while (first < last && active[first]) ++first;
+        while (last > first && active[last - 1]) --last;
+    }
+    return {first, last};
+}
+
 template<class Scalar>
 void update_ex_rows(const grid& domain, field_state<Scalar>& f, const detail::cpml_set& cpml,
                detail::cpml_memory<Scalar>& memory, const material_coefficients& coefficients,
@@ -111,48 +274,59 @@ void update_ex_rows(const grid& domain, field_state<Scalar>& f, const detail::cp
     const double inverse_dy = 1.0 / domain.spacing[1], inverse_dz = 1.0 / domain.spacing[2];
     const auto& axis_y = cpml.axes[1];
     const auto& axis_z = cpml.axes[2];
-    Scalar* ex = f.ex.data();
-    const Scalar* hy = f.hy.data();
-    const Scalar* hz = f.hz.data();
-    Scalar* psi_y = memory.ex_y.empty() ? nullptr : memory.ex_y.data();
-    Scalar* psi_z = memory.ex_z.empty() ? nullptr : memory.ex_z.data();
-    const auto* ca = coefficients.ca[0].data();
-    const auto* cb = coefficients.cb[0].data();
-    const auto* drude_a = coefficients.has_drude ? coefficients.drude_a[0].data() : nullptr;
-    const auto* drude_b = coefficients.has_drude ? coefficients.drude_b[0].data() : nullptr;
+    Scalar* LITHO_FDTD_RESTRICT ex = f.ex.data();
+    const Scalar* LITHO_FDTD_RESTRICT hy = f.hy.data();
+    const Scalar* LITHO_FDTD_RESTRICT hz = f.hz.data();
+    Scalar* LITHO_FDTD_RESTRICT psi_y = memory.ex_y.empty() ? nullptr : memory.ex_y.data();
+    Scalar* LITHO_FDTD_RESTRICT psi_z = memory.ex_z.empty() ? nullptr : memory.ex_z.data();
 
-        for (std::size_t row = row_begin; row < row_end; ++row) {
-            const std::size_t k = row / ny;
-            const std::size_t j = row % ny;
-            for (std::size_t i = 0; i < nx; ++i) {
-                const std::size_t index = i + nx * (j + ny * k);
-                const Scalar dhy_dz =
-                    diff_backward(hy, index, sz, k, nz, axis_z.periodic, phase_z_inverse, inverse_dz);
-                const Scalar dhz_dy =
-                    diff_backward(hz, index, sy, j, ny, axis_y.periodic, phase_y_inverse, inverse_dy);
-                Scalar stretched_y = dhz_dy;
-                Scalar stretched_z = dhy_dz;
-                if (!axis_y.periodic && axis_y.pml_int[j]) {
-                    const Scalar previous = psi_y[index];
-                    stretched_y = dhz_dy * axis_y.inv_kappa_int[j] + previous;
-                    psi_y[index] = axis_y.b_e_int[j] * previous + axis_y.c_e_int[j] * dhz_dy;
-                }
-                if (!axis_z.periodic && axis_z.pml_int[k]) {
-                    const Scalar previous = psi_z[index];
-                    stretched_z = dhy_dz * axis_z.inv_kappa_int[k] + previous;
-                    psi_z[index] = axis_z.b_e_int[k] * previous + axis_z.c_e_int[k] * dhy_dz;
-                }
-                const Scalar curl = stretched_y - stretched_z;
-                if (dispersion) {
-                    const Scalar previous = dispersion->jx[index];
-                    const Scalar next = drude_a[index] * previous + drude_b[index] * ex[index];
-                    ex[index] = ca[index] * ex[index] + cb[index] * (curl - 0.5 * (next + previous));
-                    dispersion->jx[index] = next;
-                } else {
-                    ex[index] = ca[index] * ex[index] + cb[index] * curl;
-                }
+    for (std::size_t row = row_begin; row < row_end; ++row) {
+        const std::size_t k = row / ny;
+        const std::size_t j = row % ny;
+        const auto cb = coefficients.cb[0].row(row, nx);
+        const auto ca = coefficients.ca[0].row(row, nx);
+        const auto drude_a = dispersion ? coefficients.drude_a[0].row(row, nx)
+                                      : coefficient_array::row_view{nullptr, 0};
+        const auto drude_b = dispersion ? coefficients.drude_b[0].row(row, nx)
+                                      : coefficient_array::row_view{nullptr, 0};
+        auto update_boundary = [&](std::size_t i) {
+            const std::size_t index = i + nx * (j + ny * k);
+            const Scalar dhy_dz =
+                diff_backward(hy, index, sz, k, nz, axis_z.periodic, phase_z_inverse, inverse_dz);
+            const Scalar dhz_dy =
+                diff_backward(hz, index, sy, j, ny, axis_y.periodic, phase_y_inverse, inverse_dy);
+            Scalar stretched_y = dhz_dy;
+            Scalar stretched_z = dhy_dz;
+            if (!axis_y.periodic && axis_y.pml_int[j]) {
+                const Scalar previous = psi_y[index];
+                stretched_y = dhz_dy * axis_y.inv_kappa_int[j] + previous;
+                psi_y[index] = axis_y.b_e_int[j] * previous + axis_y.c_e_int[j] * dhz_dy;
             }
+            if (!axis_z.periodic && axis_z.pml_int[k]) {
+                const Scalar previous = psi_z[index];
+                stretched_z = dhy_dz * axis_z.inv_kappa_int[k] + previous;
+                psi_z[index] = axis_z.b_e_int[k] * previous + axis_z.c_e_int[k] * dhy_dz;
+            }
+            const Scalar curl = stretched_y - stretched_z;
+            if (dispersion) {
+                const Scalar previous = dispersion->jx[index];
+                const Scalar next = drude_a[i] * previous + drude_b[i] * ex[index];
+                ex[index] = ca[i] * ex[index] + cb[i] * (curl - 0.5 * (next + previous));
+                dispersion->jx[index] = next;
+            } else {
+                ex[index] = ca[i] * ex[index] + cb[i] * curl;
+            }
+        };
+        if (!dispersion && j > 0 && k > 0) {
+            const std::size_t base = row * nx;
+            update_bulk_row<true>(ex + base, hz + base, hz + base - sy, hy + base, hy + base - sz,
+                                 inverse_dy, inverse_dz, ca, cb,
+                                 make_row_stretch(memory.ex_y, axis_y, j, base, true),
+                                 make_row_stretch(memory.ex_z, axis_z, k, base, true), 0, nx);
+        } else {
+            for (std::size_t i = 0; i < nx; ++i) update_boundary(i);
         }
+    }
 }
 
 
@@ -166,48 +340,63 @@ void update_ey_rows(const grid& domain, field_state<Scalar>& f, const detail::cp
     const double inverse_dx = 1.0 / domain.spacing[0], inverse_dz = 1.0 / domain.spacing[2];
     const auto& axis_x = cpml.axes[0];
     const auto& axis_z = cpml.axes[2];
-    Scalar* ey = f.ey.data();
-    const Scalar* hx = f.hx.data();
-    const Scalar* hz = f.hz.data();
-    Scalar* psi_x = memory.ey_x.empty() ? nullptr : memory.ey_x.data();
-    Scalar* psi_z = memory.ey_z.empty() ? nullptr : memory.ey_z.data();
-    const auto* ca = coefficients.ca[1].data();
-    const auto* cb = coefficients.cb[1].data();
-    const auto* drude_a = coefficients.has_drude ? coefficients.drude_a[1].data() : nullptr;
-    const auto* drude_b = coefficients.has_drude ? coefficients.drude_b[1].data() : nullptr;
+    Scalar* LITHO_FDTD_RESTRICT ey = f.ey.data();
+    const Scalar* LITHO_FDTD_RESTRICT hx = f.hx.data();
+    const Scalar* LITHO_FDTD_RESTRICT hz = f.hz.data();
+    Scalar* LITHO_FDTD_RESTRICT psi_x = memory.ey_x.empty() ? nullptr : memory.ey_x.data();
+    Scalar* LITHO_FDTD_RESTRICT psi_z = memory.ey_z.empty() ? nullptr : memory.ey_z.data();
 
-        for (std::size_t row = row_begin; row < row_end; ++row) {
-            const std::size_t k = row / ny;
-            const std::size_t j = row % ny;
-            for (std::size_t i = 0; i < nx; ++i) {
-                const std::size_t index = i + nx * (j + ny * k);
-                const Scalar dhx_dz =
-                    diff_backward(hx, index, sz, k, nz, axis_z.periodic, phase_z_inverse, inverse_dz);
-                const Scalar dhz_dx =
-                    diff_backward(hz, index, sx, i, nx, axis_x.periodic, phase_x_inverse, inverse_dx);
-                Scalar stretched_z = dhx_dz;
-                Scalar stretched_x = dhz_dx;
-                if (!axis_z.periodic && axis_z.pml_int[k]) {
-                    const Scalar previous = psi_z[index];
-                    stretched_z = dhx_dz * axis_z.inv_kappa_int[k] + previous;
-                    psi_z[index] = axis_z.b_e_int[k] * previous + axis_z.c_e_int[k] * dhx_dz;
-                }
-                if (!axis_x.periodic && axis_x.pml_int[i]) {
-                    const Scalar previous = psi_x[index];
-                    stretched_x = dhz_dx * axis_x.inv_kappa_int[i] + previous;
-                    psi_x[index] = axis_x.b_e_int[i] * previous + axis_x.c_e_int[i] * dhz_dx;
-                }
-                const Scalar curl = stretched_z - stretched_x;
-                if (dispersion) {
-                    const Scalar previous = dispersion->jy[index];
-                    const Scalar next = drude_a[index] * previous + drude_b[index] * ey[index];
-                    ey[index] = ca[index] * ey[index] + cb[index] * (curl - 0.5 * (next + previous));
-                    dispersion->jy[index] = next;
-                } else {
-                    ey[index] = ca[index] * ey[index] + cb[index] * curl;
-                }
+    const auto [bulk_first, bulk_last] = bulk_x_range(axis_x, true);
+
+    for (std::size_t row = row_begin; row < row_end; ++row) {
+        const std::size_t k = row / ny;
+        const std::size_t j = row % ny;
+        const auto cb = coefficients.cb[1].row(row, nx);
+        const auto ca = coefficients.ca[1].row(row, nx);
+        const auto drude_a = dispersion ? coefficients.drude_a[1].row(row, nx)
+                                      : coefficient_array::row_view{nullptr, 0};
+        const auto drude_b = dispersion ? coefficients.drude_b[1].row(row, nx)
+                                      : coefficient_array::row_view{nullptr, 0};
+        auto update_boundary = [&](std::size_t i) {
+            const std::size_t index = i + nx * (j + ny * k);
+            const Scalar dhx_dz =
+                diff_backward(hx, index, sz, k, nz, axis_z.periodic, phase_z_inverse, inverse_dz);
+            const Scalar dhz_dx =
+                diff_backward(hz, index, sx, i, nx, axis_x.periodic, phase_x_inverse, inverse_dx);
+            Scalar stretched_z = dhx_dz;
+            Scalar stretched_x = dhz_dx;
+            if (!axis_z.periodic && axis_z.pml_int[k]) {
+                const Scalar previous = psi_z[index];
+                stretched_z = dhx_dz * axis_z.inv_kappa_int[k] + previous;
+                psi_z[index] = axis_z.b_e_int[k] * previous + axis_z.c_e_int[k] * dhx_dz;
             }
+            if (!axis_x.periodic && axis_x.pml_int[i]) {
+                const Scalar previous = psi_x[index];
+                stretched_x = dhz_dx * axis_x.inv_kappa_int[i] + previous;
+                psi_x[index] = axis_x.b_e_int[i] * previous + axis_x.c_e_int[i] * dhz_dx;
+            }
+            const Scalar curl = stretched_z - stretched_x;
+            if (dispersion) {
+                const Scalar previous = dispersion->jy[index];
+                const Scalar next = drude_a[i] * previous + drude_b[i] * ey[index];
+                ey[index] = ca[i] * ey[index] + cb[i] * (curl - 0.5 * (next + previous));
+                dispersion->jy[index] = next;
+            } else {
+                ey[index] = ca[i] * ey[index] + cb[i] * curl;
+            }
+        };
+        if (!dispersion && k > 0) {
+            const std::size_t base = row * nx + bulk_first;
+            update_bulk_row<true>(ey + base, hx + base, hx + base - sz, hz + base, hz + base - sx,
+                                 inverse_dz, inverse_dx, ca.offset(bulk_first), cb.offset(bulk_first),
+                                 make_row_stretch(memory.ey_z, axis_z, k, base, true), row_stretch<Scalar>{},
+                                 0, bulk_last - bulk_first);
+            for (std::size_t i = 0; i < bulk_first; ++i) update_boundary(i);
+            for (std::size_t i = bulk_last; i < nx; ++i) update_boundary(i);
+        } else {
+            for (std::size_t i = 0; i < nx; ++i) update_boundary(i);
         }
+    }
 }
 
 
@@ -221,48 +410,63 @@ void update_ez_rows(const grid& domain, field_state<Scalar>& f, const detail::cp
     const double inverse_dx = 1.0 / domain.spacing[0], inverse_dy = 1.0 / domain.spacing[1];
     const auto& axis_x = cpml.axes[0];
     const auto& axis_y = cpml.axes[1];
-    Scalar* ez = f.ez.data();
-    const Scalar* hx = f.hx.data();
-    const Scalar* hy = f.hy.data();
-    Scalar* psi_x = memory.ez_x.empty() ? nullptr : memory.ez_x.data();
-    Scalar* psi_y = memory.ez_y.empty() ? nullptr : memory.ez_y.data();
-    const auto* ca = coefficients.ca[2].data();
-    const auto* cb = coefficients.cb[2].data();
-    const auto* drude_a = coefficients.has_drude ? coefficients.drude_a[2].data() : nullptr;
-    const auto* drude_b = coefficients.has_drude ? coefficients.drude_b[2].data() : nullptr;
+    Scalar* LITHO_FDTD_RESTRICT ez = f.ez.data();
+    const Scalar* LITHO_FDTD_RESTRICT hx = f.hx.data();
+    const Scalar* LITHO_FDTD_RESTRICT hy = f.hy.data();
+    Scalar* LITHO_FDTD_RESTRICT psi_x = memory.ez_x.empty() ? nullptr : memory.ez_x.data();
+    Scalar* LITHO_FDTD_RESTRICT psi_y = memory.ez_y.empty() ? nullptr : memory.ez_y.data();
 
-        for (std::size_t row = row_begin; row < row_end; ++row) {
-            const std::size_t k = row / ny;
-            const std::size_t j = row % ny;
-            for (std::size_t i = 0; i < nx; ++i) {
-                const std::size_t index = i + nx * (j + ny * k);
-                const Scalar dhy_dx =
-                    diff_backward(hy, index, sx, i, nx, axis_x.periodic, phase_x_inverse, inverse_dx);
-                const Scalar dhx_dy =
-                    diff_backward(hx, index, sy, j, ny, axis_y.periodic, phase_y_inverse, inverse_dy);
-                Scalar stretched_x = dhy_dx;
-                Scalar stretched_y = dhx_dy;
-                if (!axis_x.periodic && axis_x.pml_int[i]) {
-                    const Scalar previous = psi_x[index];
-                    stretched_x = dhy_dx * axis_x.inv_kappa_int[i] + previous;
-                    psi_x[index] = axis_x.b_e_int[i] * previous + axis_x.c_e_int[i] * dhy_dx;
-                }
-                if (!axis_y.periodic && axis_y.pml_int[j]) {
-                    const Scalar previous = psi_y[index];
-                    stretched_y = dhx_dy * axis_y.inv_kappa_int[j] + previous;
-                    psi_y[index] = axis_y.b_e_int[j] * previous + axis_y.c_e_int[j] * dhx_dy;
-                }
-                const Scalar curl = stretched_x - stretched_y;
-                if (dispersion) {
-                    const Scalar previous = dispersion->jz[index];
-                    const Scalar next = drude_a[index] * previous + drude_b[index] * ez[index];
-                    ez[index] = ca[index] * ez[index] + cb[index] * (curl - 0.5 * (next + previous));
-                    dispersion->jz[index] = next;
-                } else {
-                    ez[index] = ca[index] * ez[index] + cb[index] * curl;
-                }
+    const auto [bulk_first, bulk_last] = bulk_x_range(axis_x, true);
+
+    for (std::size_t row = row_begin; row < row_end; ++row) {
+        const std::size_t k = row / ny;
+        const std::size_t j = row % ny;
+        const auto cb = coefficients.cb[2].row(row, nx);
+        const auto ca = coefficients.ca[2].row(row, nx);
+        const auto drude_a = dispersion ? coefficients.drude_a[2].row(row, nx)
+                                      : coefficient_array::row_view{nullptr, 0};
+        const auto drude_b = dispersion ? coefficients.drude_b[2].row(row, nx)
+                                      : coefficient_array::row_view{nullptr, 0};
+        auto update_boundary = [&](std::size_t i) {
+            const std::size_t index = i + nx * (j + ny * k);
+            const Scalar dhy_dx =
+                diff_backward(hy, index, sx, i, nx, axis_x.periodic, phase_x_inverse, inverse_dx);
+            const Scalar dhx_dy =
+                diff_backward(hx, index, sy, j, ny, axis_y.periodic, phase_y_inverse, inverse_dy);
+            Scalar stretched_x = dhy_dx;
+            Scalar stretched_y = dhx_dy;
+            if (!axis_x.periodic && axis_x.pml_int[i]) {
+                const Scalar previous = psi_x[index];
+                stretched_x = dhy_dx * axis_x.inv_kappa_int[i] + previous;
+                psi_x[index] = axis_x.b_e_int[i] * previous + axis_x.c_e_int[i] * dhy_dx;
             }
+            if (!axis_y.periodic && axis_y.pml_int[j]) {
+                const Scalar previous = psi_y[index];
+                stretched_y = dhx_dy * axis_y.inv_kappa_int[j] + previous;
+                psi_y[index] = axis_y.b_e_int[j] * previous + axis_y.c_e_int[j] * dhx_dy;
+            }
+            const Scalar curl = stretched_x - stretched_y;
+            if (dispersion) {
+                const Scalar previous = dispersion->jz[index];
+                const Scalar next = drude_a[i] * previous + drude_b[i] * ez[index];
+                ez[index] = ca[i] * ez[index] + cb[i] * (curl - 0.5 * (next + previous));
+                dispersion->jz[index] = next;
+            } else {
+                ez[index] = ca[i] * ez[index] + cb[i] * curl;
+            }
+        };
+        if (!dispersion && j > 0) {
+            const std::size_t base = row * nx + bulk_first;
+            update_bulk_row<true>(ez + base, hy + base, hy + base - sx, hx + base, hx + base - sy,
+                                 inverse_dx, inverse_dy, ca.offset(bulk_first), cb.offset(bulk_first),
+                                 row_stretch<Scalar>{}, make_row_stretch(memory.ez_y, axis_y, j, base, true),
+                                 0, bulk_last - bulk_first);
+            for (std::size_t i = 0; i < bulk_first; ++i) update_boundary(i);
+            for (std::size_t i = bulk_last; i < nx; ++i) update_boundary(i);
+        } else {
+            for (std::size_t i = 0; i < nx; ++i) update_boundary(i);
         }
+    }
 }
 
 
@@ -275,37 +479,46 @@ void update_hx_rows(const grid& domain, field_state<Scalar>& f, const detail::cp
     const double inverse_dy = 1.0 / domain.spacing[1], inverse_dz = 1.0 / domain.spacing[2];
     const auto& axis_y = cpml.axes[1];
     const auto& axis_z = cpml.axes[2];
-    Scalar* hx = f.hx.data();
-    const Scalar* ey = f.ey.data();
-    const Scalar* ez = f.ez.data();
-    Scalar* psi_y = memory.hx_y.empty() ? nullptr : memory.hx_y.data();
-    Scalar* psi_z = memory.hx_z.empty() ? nullptr : memory.hx_z.data();
-    const auto* cb = coefficients.h_cb[0].data();
+    Scalar* LITHO_FDTD_RESTRICT hx = f.hx.data();
+    const Scalar* LITHO_FDTD_RESTRICT ey = f.ey.data();
+    const Scalar* LITHO_FDTD_RESTRICT ez = f.ez.data();
+    Scalar* LITHO_FDTD_RESTRICT psi_y = memory.hx_y.empty() ? nullptr : memory.hx_y.data();
+    Scalar* LITHO_FDTD_RESTRICT psi_z = memory.hx_z.empty() ? nullptr : memory.hx_z.data();
 
-        for (std::size_t row = row_begin; row < row_end; ++row) {
-            const std::size_t k = row / ny;
-            const std::size_t j = row % ny;
-            for (std::size_t i = 0; i < nx; ++i) {
-                const std::size_t index = i + nx * (j + ny * k);
-                const Scalar dey_dz =
-                    diff_forward(ey, index, sz, k, nz, axis_z.periodic, phase_z, inverse_dz);
-                const Scalar dez_dy =
-                    diff_forward(ez, index, sy, j, ny, axis_y.periodic, phase_y, inverse_dy);
-                Scalar stretched_z = dey_dz;
-                Scalar stretched_y = dez_dy;
-                if (!axis_z.periodic && axis_z.pml_half[k]) {
-                    const Scalar previous = psi_z[index];
-                    stretched_z = dey_dz * axis_z.inv_kappa_half[k] + previous;
-                    psi_z[index] = axis_z.b_h_half[k] * previous + axis_z.c_h_half[k] * dey_dz;
-                }
-                if (!axis_y.periodic && axis_y.pml_half[j]) {
-                    const Scalar previous = psi_y[index];
-                    stretched_y = dez_dy * axis_y.inv_kappa_half[j] + previous;
-                    psi_y[index] = axis_y.b_h_half[j] * previous + axis_y.c_h_half[j] * dez_dy;
-                }
-                hx[index] += cb[index] * (stretched_z - stretched_y);
+    for (std::size_t row = row_begin; row < row_end; ++row) {
+        const std::size_t k = row / ny;
+        const std::size_t j = row % ny;
+        const auto cb = coefficients.h_cb[0].row(row, nx);
+        auto update_boundary = [&](std::size_t i) {
+            const std::size_t index = i + nx * (j + ny * k);
+            const Scalar dey_dz =
+                diff_forward(ey, index, sz, k, nz, axis_z.periodic, phase_z, inverse_dz);
+            const Scalar dez_dy =
+                diff_forward(ez, index, sy, j, ny, axis_y.periodic, phase_y, inverse_dy);
+            Scalar stretched_z = dey_dz;
+            Scalar stretched_y = dez_dy;
+            if (!axis_z.periodic && axis_z.pml_half[k]) {
+                const Scalar previous = psi_z[index];
+                stretched_z = dey_dz * axis_z.inv_kappa_half[k] + previous;
+                psi_z[index] = axis_z.b_h_half[k] * previous + axis_z.c_h_half[k] * dey_dz;
             }
+            if (!axis_y.periodic && axis_y.pml_half[j]) {
+                const Scalar previous = psi_y[index];
+                stretched_y = dez_dy * axis_y.inv_kappa_half[j] + previous;
+                psi_y[index] = axis_y.b_h_half[j] * previous + axis_y.c_h_half[j] * dez_dy;
+            }
+            hx[index] += cb[i] * (stretched_z - stretched_y);
+        };
+        if (j + 1 < ny && k + 1 < nz) {
+            const std::size_t base = row * nx;
+            update_bulk_row<false>(hx + base, ey + base + sz, ey + base, ez + base + sy, ez + base,
+                                 inverse_dz, inverse_dy, coefficient_array::row_view{nullptr, 1}, cb,
+                                 make_row_stretch(memory.hx_z, axis_z, k, base, false),
+                                 make_row_stretch(memory.hx_y, axis_y, j, base, false), 0, nx);
+        } else {
+            for (std::size_t i = 0; i < nx; ++i) update_boundary(i);
         }
+    }
 }
 
 
@@ -318,37 +531,50 @@ void update_hy_rows(const grid& domain, field_state<Scalar>& f, const detail::cp
     const double inverse_dx = 1.0 / domain.spacing[0], inverse_dz = 1.0 / domain.spacing[2];
     const auto& axis_x = cpml.axes[0];
     const auto& axis_z = cpml.axes[2];
-    Scalar* hy = f.hy.data();
-    const Scalar* ez = f.ez.data();
-    const Scalar* ex = f.ex.data();
-    Scalar* psi_x = memory.hy_x.empty() ? nullptr : memory.hy_x.data();
-    Scalar* psi_z = memory.hy_z.empty() ? nullptr : memory.hy_z.data();
-    const auto* cb = coefficients.h_cb[1].data();
+    Scalar* LITHO_FDTD_RESTRICT hy = f.hy.data();
+    const Scalar* LITHO_FDTD_RESTRICT ez = f.ez.data();
+    const Scalar* LITHO_FDTD_RESTRICT ex = f.ex.data();
+    Scalar* LITHO_FDTD_RESTRICT psi_x = memory.hy_x.empty() ? nullptr : memory.hy_x.data();
+    Scalar* LITHO_FDTD_RESTRICT psi_z = memory.hy_z.empty() ? nullptr : memory.hy_z.data();
 
-        for (std::size_t row = row_begin; row < row_end; ++row) {
-            const std::size_t k = row / ny;
-            const std::size_t j = row % ny;
-            for (std::size_t i = 0; i < nx; ++i) {
-                const std::size_t index = i + nx * (j + ny * k);
-                const Scalar dez_dx =
-                    diff_forward(ez, index, sx, i, nx, axis_x.periodic, phase_x, inverse_dx);
-                const Scalar dex_dz =
-                    diff_forward(ex, index, sz, k, nz, axis_z.periodic, phase_z, inverse_dz);
-                Scalar stretched_x = dez_dx;
-                Scalar stretched_z = dex_dz;
-                if (!axis_x.periodic && axis_x.pml_half[i]) {
-                    const Scalar previous = psi_x[index];
-                    stretched_x = dez_dx * axis_x.inv_kappa_half[i] + previous;
-                    psi_x[index] = axis_x.b_h_half[i] * previous + axis_x.c_h_half[i] * dez_dx;
-                }
-                if (!axis_z.periodic && axis_z.pml_half[k]) {
-                    const Scalar previous = psi_z[index];
-                    stretched_z = dex_dz * axis_z.inv_kappa_half[k] + previous;
-                    psi_z[index] = axis_z.b_h_half[k] * previous + axis_z.c_h_half[k] * dex_dz;
-                }
-                hy[index] += cb[index] * (stretched_x - stretched_z);
+    const auto [bulk_first, bulk_last] = bulk_x_range(axis_x, false);
+
+    for (std::size_t row = row_begin; row < row_end; ++row) {
+        const std::size_t k = row / ny;
+        const std::size_t j = row % ny;
+        const auto cb = coefficients.h_cb[1].row(row, nx);
+        auto update_boundary = [&](std::size_t i) {
+            const std::size_t index = i + nx * (j + ny * k);
+            const Scalar dez_dx =
+                diff_forward(ez, index, sx, i, nx, axis_x.periodic, phase_x, inverse_dx);
+            const Scalar dex_dz =
+                diff_forward(ex, index, sz, k, nz, axis_z.periodic, phase_z, inverse_dz);
+            Scalar stretched_x = dez_dx;
+            Scalar stretched_z = dex_dz;
+            if (!axis_x.periodic && axis_x.pml_half[i]) {
+                const Scalar previous = psi_x[index];
+                stretched_x = dez_dx * axis_x.inv_kappa_half[i] + previous;
+                psi_x[index] = axis_x.b_h_half[i] * previous + axis_x.c_h_half[i] * dez_dx;
             }
+            if (!axis_z.periodic && axis_z.pml_half[k]) {
+                const Scalar previous = psi_z[index];
+                stretched_z = dex_dz * axis_z.inv_kappa_half[k] + previous;
+                psi_z[index] = axis_z.b_h_half[k] * previous + axis_z.c_h_half[k] * dex_dz;
+            }
+            hy[index] += cb[i] * (stretched_x - stretched_z);
+        };
+        if (k + 1 < nz) {
+            const std::size_t base = row * nx + bulk_first;
+            update_bulk_row<false>(hy + base, ez + base + sx, ez + base, ex + base + sz, ex + base,
+                                 inverse_dx, inverse_dz, coefficient_array::row_view{nullptr, 1}, cb.offset(bulk_first),
+                                 row_stretch<Scalar>{}, make_row_stretch(memory.hy_z, axis_z, k, base, false),
+                                 0, bulk_last - bulk_first);
+            for (std::size_t i = 0; i < bulk_first; ++i) update_boundary(i);
+            for (std::size_t i = bulk_last; i < nx; ++i) update_boundary(i);
+        } else {
+            for (std::size_t i = 0; i < nx; ++i) update_boundary(i);
         }
+    }
 }
 
 
@@ -361,37 +587,50 @@ void update_hz_rows(const grid& domain, field_state<Scalar>& f, const detail::cp
     const double inverse_dx = 1.0 / domain.spacing[0], inverse_dy = 1.0 / domain.spacing[1];
     const auto& axis_x = cpml.axes[0];
     const auto& axis_y = cpml.axes[1];
-    Scalar* hz = f.hz.data();
-    const Scalar* ex = f.ex.data();
-    const Scalar* ey = f.ey.data();
-    Scalar* psi_x = memory.hz_x.empty() ? nullptr : memory.hz_x.data();
-    Scalar* psi_y = memory.hz_y.empty() ? nullptr : memory.hz_y.data();
-    const auto* cb = coefficients.h_cb[2].data();
+    Scalar* LITHO_FDTD_RESTRICT hz = f.hz.data();
+    const Scalar* LITHO_FDTD_RESTRICT ex = f.ex.data();
+    const Scalar* LITHO_FDTD_RESTRICT ey = f.ey.data();
+    Scalar* LITHO_FDTD_RESTRICT psi_x = memory.hz_x.empty() ? nullptr : memory.hz_x.data();
+    Scalar* LITHO_FDTD_RESTRICT psi_y = memory.hz_y.empty() ? nullptr : memory.hz_y.data();
 
-        for (std::size_t row = row_begin; row < row_end; ++row) {
-            const std::size_t k = row / ny;
-            const std::size_t j = row % ny;
-            for (std::size_t i = 0; i < nx; ++i) {
-                const std::size_t index = i + nx * (j + ny * k);
-                const Scalar dex_dy =
-                    diff_forward(ex, index, sy, j, ny, axis_y.periodic, phase_y, inverse_dy);
-                const Scalar dey_dx =
-                    diff_forward(ey, index, sx, i, nx, axis_x.periodic, phase_x, inverse_dx);
-                Scalar stretched_y = dex_dy;
-                Scalar stretched_x = dey_dx;
-                if (!axis_y.periodic && axis_y.pml_half[j]) {
-                    const Scalar previous = psi_y[index];
-                    stretched_y = dex_dy * axis_y.inv_kappa_half[j] + previous;
-                    psi_y[index] = axis_y.b_h_half[j] * previous + axis_y.c_h_half[j] * dex_dy;
-                }
-                if (!axis_x.periodic && axis_x.pml_half[i]) {
-                    const Scalar previous = psi_x[index];
-                    stretched_x = dey_dx * axis_x.inv_kappa_half[i] + previous;
-                    psi_x[index] = axis_x.b_h_half[i] * previous + axis_x.c_h_half[i] * dey_dx;
-                }
-                hz[index] += cb[index] * (stretched_y - stretched_x);
+    const auto [bulk_first, bulk_last] = bulk_x_range(axis_x, false);
+
+    for (std::size_t row = row_begin; row < row_end; ++row) {
+        const std::size_t k = row / ny;
+        const std::size_t j = row % ny;
+        const auto cb = coefficients.h_cb[2].row(row, nx);
+        auto update_boundary = [&](std::size_t i) {
+            const std::size_t index = i + nx * (j + ny * k);
+            const Scalar dex_dy =
+                diff_forward(ex, index, sy, j, ny, axis_y.periodic, phase_y, inverse_dy);
+            const Scalar dey_dx =
+                diff_forward(ey, index, sx, i, nx, axis_x.periodic, phase_x, inverse_dx);
+            Scalar stretched_y = dex_dy;
+            Scalar stretched_x = dey_dx;
+            if (!axis_y.periodic && axis_y.pml_half[j]) {
+                const Scalar previous = psi_y[index];
+                stretched_y = dex_dy * axis_y.inv_kappa_half[j] + previous;
+                psi_y[index] = axis_y.b_h_half[j] * previous + axis_y.c_h_half[j] * dex_dy;
             }
+            if (!axis_x.periodic && axis_x.pml_half[i]) {
+                const Scalar previous = psi_x[index];
+                stretched_x = dey_dx * axis_x.inv_kappa_half[i] + previous;
+                psi_x[index] = axis_x.b_h_half[i] * previous + axis_x.c_h_half[i] * dey_dx;
+            }
+            hz[index] += cb[i] * (stretched_y - stretched_x);
+        };
+        if (j + 1 < ny) {
+            const std::size_t base = row * nx + bulk_first;
+            update_bulk_row<false>(hz + base, ex + base + sy, ex + base, ey + base + sx, ey + base,
+                                 inverse_dy, inverse_dx, coefficient_array::row_view{nullptr, 1}, cb.offset(bulk_first),
+                                 make_row_stretch(memory.hz_y, axis_y, j, base, false), row_stretch<Scalar>{},
+                                 0, bulk_last - bulk_first);
+            for (std::size_t i = 0; i < bulk_first; ++i) update_boundary(i);
+            for (std::size_t i = bulk_last; i < nx; ++i) update_boundary(i);
+        } else {
+            for (std::size_t i = 0; i < nx; ++i) update_boundary(i);
         }
+    }
 }
 
 
@@ -586,6 +825,16 @@ result<material_coefficients> build_coefficients(const problem& value, const mat
                 const material* entry = value.materials.at(ids[index]);
                 if (!entry) return fail(errc::missing_material);
                 out.h_cb[c][index] = dt / (vacuum_permeability * entry->mu_r);
+            }
+        }
+        const std::size_t nx = value.grid.cells[0];
+        for (std::size_t c = 0; c < 3; ++c) {
+            out.ca[c].compress_rows(nx);
+            out.cb[c].compress_rows(nx);
+            out.h_cb[c].compress_rows(nx);
+            if (has_drude) {
+                out.drude_a[c].compress_rows(nx);
+                out.drude_b[c].compress_rows(nx);
             }
         }
         return out;
